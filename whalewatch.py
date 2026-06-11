@@ -252,11 +252,28 @@ _SUFFIX = {"INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY", "LTD",
            "COM", "COMMON", "SHARES", "ADR", "ADS", "NEW", "SPONSORED", "PAR"}
 
 def _norm(s):
-    s = re.sub(r"[^A-Za-z0-9 ]", " ", (s or "").upper())
+    s = (s or "").upper()
+    s = re.sub(r"[.'`&]", "", s)              # delete apostrophes/periods/& (MOODY'S -> MOODYS)
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
     toks = [t for t in s.split() if t and t not in _SUFFIX and len(t) > 1]
     return " ".join(toks)
 
+# Reliable CUSIP -> ticker for common holdings whose 13F names don't match the
+# official ticker list (abbreviations like "BANK AMERICA", "OCCIDENTAL PETE").
+CUSIP_TICKER = {
+    "060505104": "BAC", "674599105": "OXY", "H1467J104": "CB", "615369105": "MCO",
+    "829933100": "SIRI", "92343E102": "VRSN", "14040H105": "COF", "650111107": "NYT",
+    "02005N100": "ALLY", "546347105": "LPX", "47233W109": "JEF", "25754A201": "DPZ",
+    "G0403H108": "AON", "73278L105": "POOL", "422806208": "HEI", "037833100": "AAPL",
+    "025816109": "AXP", "191216100": "KO", "166764100": "CVX", "500754106": "KHC",
+    "23918K108": "DVA", "501044101": "KR", "247361702": "DAL", "02079K305": "GOOGL",
+    "02079K107": "GOOG", "92826C839": "V", "57636Q104": "MA", "91324P102": "UNH",
+    "023135106": "AMZN", "21036P108": "STZ", "62944T105": "NVR", "670346105": "NUE",
+    "526057104": "LEN", "16119P108": "CHTR", "512816109": "LAMR",
+}
+
 _TMAPS = None
+_NORM2T_NS = {}   # spaceless normalized name -> ticker (catches "SIRIUS XM" vs "SIRIUSXM")
 def _load_company_tickers():
     path = os.path.join(HERE, "tickers.json")
     if os.path.exists(path):
@@ -290,14 +307,20 @@ def ticker_maps():
             n = _norm(title)
             if n and n not in norm2t:
                 norm2t[n] = t
+            ns = n.replace(" ", "")
+            if ns and ns not in _NORM2T_NS:
+                _NORM2T_NS[ns] = t
     except Exception:
         pass
     _TMAPS = (t2title, norm2t)
     return _TMAPS
 
-def ticker_for(name):
+def ticker_for(name, cusip=None):
+    if cusip and cusip.upper() in CUSIP_TICKER:   # reliable CUSIP match first
+        return CUSIP_TICKER[cusip.upper()]
     _, norm2t = ticker_maps()
-    return norm2t.get(_norm(name))
+    n = _norm(name)
+    return norm2t.get(n) or _NORM2T_NS.get(n.replace(" ", ""))  # spaced, then spaceless
 
 def cik_for_name(name):
     ticker_maps()
@@ -374,8 +397,9 @@ def enrich_security(cusip, name, max_price_age_days=7):
     if cached and cached.get("sector") is not None and fresh_price:
         return cached
 
-    ticker = (cached or {}).get("ticker") or ticker_for(name)
-    cik = (cached or {}).get("cik") or (cik_for_name(name) if ticker else None)
+    ticker = (cached or {}).get("ticker") or ticker_for(name, cusip)
+    ticker_maps()  # ensure ticker->CIK map is loaded
+    cik = (cached or {}).get("cik") or (_T2CIK.get(ticker) if ticker else None)
     sector = (cached or {}).get("sector")
     shares_out = (cached or {}).get("shares_out")
     shares_date = (cached or {}).get("shares_out_date")
