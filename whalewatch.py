@@ -181,9 +181,10 @@ def _load_company_tickers():
         pass
     return data
 
+_T2CIK = {}
 def ticker_maps():
     """Return (ticker->title, normalized_name->ticker). Cached; needs network once."""
-    global _TMAPS
+    global _TMAPS, _T2CIK
     if _TMAPS is not None:
         return _TMAPS
     t2title, norm2t = {}, {}
@@ -194,6 +195,8 @@ def ticker_maps():
             if not t:
                 continue
             t2title.setdefault(t, title)
+            if v.get("cik_str"):
+                _T2CIK[t] = str(v["cik_str"]).zfill(10)
             n = _norm(title)
             if n and n not in norm2t:
                 norm2t[n] = t
@@ -205,6 +208,101 @@ def ticker_maps():
 def ticker_for(name):
     _, norm2t = ticker_maps()
     return norm2t.get(_norm(name))
+
+def cik_for_name(name):
+    ticker_maps()
+    t = ticker_for(name)
+    return _T2CIK.get(t) if t else None
+
+# ---------------------------------------------------------------------------
+# Enrichment: sector (SEC SIC), shares outstanding (SEC XBRL), 12m return (price)
+# All best-effort + cached. Never blocks/breaks the core 13F view.
+# ---------------------------------------------------------------------------
+def _http_get(url, headers=None, timeout=15):
+    h = {"User-Agent": "Mozilla/5.0 (compatible; WhaleWatch/1.0)"}
+    if headers:
+        h.update(headers)
+    r = requests.get(url, headers=h, timeout=timeout)
+    r.raise_for_status()
+    return r
+
+def _company_sic(cik):
+    try:
+        return get_submissions(cik).get("sicDescription") or ""
+    except Exception:
+        return ""
+
+def _shares_outstanding(cik):
+    """Latest reported common shares outstanding via SEC XBRL. (value, asof_date)."""
+    for taxo, tag in (("dei", "EntityCommonStockSharesOutstanding"),
+                      ("us-gaap", "CommonStockSharesOutstanding")):
+        try:
+            url = "https://data.sec.gov/api/xbrl/companyconcept/CIK%s/%s/%s.json" % (
+                str(int(cik)).zfill(10), taxo, tag)
+            j = sec_get(url).json()
+            vals = []
+            for arr in j.get("units", {}).values():
+                for it in arr:
+                    if it.get("val") and it.get("end"):
+                        vals.append((it["end"], float(it["val"])))
+            if vals:
+                vals.sort()
+                return vals[-1][1], vals[-1][0]
+        except Exception:
+            continue
+    return None, None
+
+def _ret_12m(ticker):
+    """Trailing ~12-month price return from a free price feed. Best-effort."""
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1y&interval=1mo" % ticker
+        res = _http_get(url).json()["chart"]["result"][0]
+        closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+        if len(closes) >= 2 and closes[0]:
+            return (closes[-1] - closes[0]) / closes[0]
+    except Exception:
+        pass
+    return None
+
+def _cached_security(cusip):
+    con = connect()
+    r = con.execute("SELECT * FROM securities WHERE cusip=?", (cusip,)).fetchone()
+    con.close()
+    return dict(r) if r else None
+
+def enrich_security(cusip, name, max_price_age_days=1):
+    """Resolve ticker/cik, fetch sector + shares outstanding + 12m return; cache."""
+    cusip = (cusip or "").upper()
+    cached = _cached_security(cusip)
+    fresh_price = False
+    if cached and cached.get("priced_at"):
+        try:
+            age = dt.datetime.utcnow() - dt.datetime.fromisoformat(cached["priced_at"])
+            fresh_price = age.days < max_price_age_days
+        except Exception:
+            pass
+    if cached and cached.get("sector") is not None and fresh_price:
+        return cached
+
+    ticker = (cached or {}).get("ticker") or ticker_for(name)
+    cik = (cached or {}).get("cik") or (cik_for_name(name) if ticker else None)
+    sector = (cached or {}).get("sector")
+    shares_out = (cached or {}).get("shares_out")
+    shares_date = (cached or {}).get("shares_out_date")
+    if cik and not sector:
+        sector = _company_sic(cik)
+    if cik and not shares_out:
+        shares_out, shares_date = _shares_outstanding(cik)
+    ret = _ret_12m(ticker) if ticker else None
+
+    con = connect()
+    con.execute("""INSERT OR REPLACE INTO securities
+        (cusip,ticker,cik,sector,shares_out,shares_out_date,ret_12m,enriched_at,priced_at)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (cusip, ticker, cik, sector or "", shares_out, shares_date, ret,
+         _now(), _now() if ret is not None else (cached or {}).get("priced_at")))
+    con.commit(); con.close()
+    return _cached_security(cusip)
 
 def aggregate(holdings):
     agg = {}
@@ -261,6 +359,10 @@ def init_schema():
     CREATE TABLE IF NOT EXISTS fund_filings (
         accession TEXT PRIMARY KEY, cik TEXT NOT NULL, form TEXT,
         filing_date TEXT, report_date TEXT);
+    CREATE TABLE IF NOT EXISTS securities (
+        cusip TEXT PRIMARY KEY, ticker TEXT, cik TEXT, sector TEXT,
+        shares_out REAL, shares_out_date TEXT,
+        ret_12m REAL, enriched_at TEXT, priced_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_catalog_cik    ON fund_filings(cik);
     CREATE INDEX IF NOT EXISTS idx_funds_name     ON funds(name);
     CREATE INDEX IF NOT EXISTS idx_filings_cik    ON filings(cik);
@@ -461,14 +563,40 @@ def build_fund_payload(cik, period=None):
                           key=lambda r: r["value"], reverse=True)
     active = [h for h in holdings if h["status"] != "SOLD"]
     total = sum(h["value"] for h in active) or 0.0
-    for h in holdings:  # % of portfolio (current holdings only)
+    for h in holdings:
         h["pctPortfolio"] = (h["value"] / total) if (total and h["status"] != "SOLD") else None
+        _attach_cached_enrichment(h)
     return {"name": fund["name"], "cik": cik,
             "current": {"form": curr["form"], "filingDate": curr["filing_date"], "reportDate": curr["report_date"]},
             "previous": ({"reportDate": prev["report_date"]} if prev else None),
             "totalValue": total, "positions": len(active), "holdings": holdings,
             "periods": [{"reportDate": f["report_date"], "accession": f["accession"]} for f in cat],
             "selectedPeriod": curr["report_date"]}
+
+def _attach_cached_enrichment(h):
+    """Add ticker/sector/sharesOutstanding/pctOwnership/ret12m from cache (if any)."""
+    sec = _cached_security((h.get("cusip") or "").upper())
+    h["ticker"] = (sec or {}).get("ticker")
+    h["sector"] = (sec or {}).get("sector") or None
+    so = (sec or {}).get("shares_out")
+    h["sharesOutstanding"] = so
+    h["pctOwnership"] = (h.get("shares") / so) if (so and h.get("shares")) else None
+    h["ret12m"] = (sec or {}).get("ret_12m")
+    return h
+
+def enrich_fund(cik, period=None, cap=40):
+    """Live-enrich a fund's current holdings (best-effort, cached), then return
+    the refreshed payload. Bounded to the top `cap` positions by value."""
+    payload = build_fund_payload(cik, period)
+    if payload.get("error"):
+        return payload
+    active = [h for h in payload["holdings"] if h["status"] != "SOLD"][:cap]
+    for h in active:
+        try:
+            enrich_security(h["cusip"], h["name"])
+        except Exception:
+            continue
+    return build_fund_payload(cik, period)  # rebuild with freshly cached values
 
 def build_directory(quarters=8):
     init_schema()
@@ -829,8 +957,21 @@ async function doSearch(q){
 async function openFund(cik,name,period){
   window.scrollTo(0,0);
   app.innerHTML=`<span class="back" onclick="setTab('search')">‹ back</span><div class="spin">Loading ${name||'fund'} holdings from EDGAR…<br><span style="font-size:12px">(first open downloads from SEC — can take 5–15s)</span></div>`;
-  try{const d=await api('/api/holdings/'+cik+(period?('?period='+encodeURIComponent(period)):''));renderFund(d);}
+  try{const d=await api('/api/holdings/'+cik+(period?('?period='+encodeURIComponent(period)):''));
+    renderFund(d);
+    if(!d.error&&!d.demo)enrichFund(cik,d.selectedPeriod);}
   catch(e){app.innerHTML=errBox(true,e.message);}
+}
+let enriching=false;
+async function enrichFund(cik,period){
+  if(enriching)return; enriching=true;
+  const tag=document.getElementById('enrichTag'); if(tag)tag.textContent='loading sector · % owned · 12-mo return…';
+  try{const d=await api('/api/enrich/'+cik+(period?('?period='+encodeURIComponent(period)):''));
+    if(!d.error&&curFund&&curFund.cik===d.cik&&curFund.selectedPeriod===d.selectedPeriod){
+      curFund=d; drawFund(false);
+    }
+  }catch(e){const t=document.getElementById('enrichTag'); if(t)t.textContent='market data unavailable';}
+  enriching=false;
 }
 function qlabel(d){if(!d)return d;const p=String(d).split('-');const q={'03':'Q1','06':'Q2','09':'Q3','12':'Q4'}[p[1]]||p[1];return q+' '+p[0];}
 async function loadDemo(){window.scrollTo(0,0);
@@ -871,6 +1012,7 @@ function drawFund(demo){
   const fl=['CURRENT','NEW','ADDED','TRIMMED','SOLD','HOLD'];
   h+=`<div class="filterbar">`+fl.map(f=>{const n=f==='CURRENT'?active:(counts[f]||0);
      return `<span class="chip ${filter===f?'on':''}" onclick="setFilter('${f}')">${f} ${n}</span>`;}).join('')+`</div>`;
+  h+=`<div id="enrichTag" class="muted" style="font-size:11.5px;margin:0 2px 8px"></div>`;
   // rows — CURRENT shows what the fund holds now (matches Wisdom Whale); SOLD lives in its own tab
   h+=`<div class="card" style="padding:4px 14px">`;
   const rows=d.holdings.filter(x=>filter==='CURRENT'?x.status!=='SOLD':x.status===filter);
@@ -880,15 +1022,23 @@ function drawFund(demo){
     if(x.status==='SOLD')p=`<div class="pct dn">sold out</div>`;
     else if(x.sharesChangePct===null)p=`<div class="pct up">new buy</div>`;
     else if(x.sharesChangePct!==0)p=`<div class="pct ${x.sharesChangePct>0?'up':'dn'}">${pct(x.sharesChangePct)} shares</div>`;
+    // enrichment line: sector · % of company · 12-mo return
+    let meta=[];
+    if(x.sector)meta.push(x.sector);
+    if(x.pctOwnership)meta.push(`${(x.pctOwnership*100).toFixed(x.pctOwnership<0.01?2:1)}% of co`);
+    let perf='';
+    if(x.ret12m!=null)perf=`<span class="${x.ret12m>=0?'up':'dn'}">12-mo ${pct(x.ret12m)}</span>`;
+    const meta2=(meta.length||perf)?`<div class="sub" style="margin-top:3px">${meta.join(' · ')}${(meta.length&&perf)?' · ':''}${perf}</div>`:'';
     h+=`<div class="hrow">
-      <div class="tkr">${tkr(x.name)}</div>
-      <div class="grow"><div class="nm">${x.name}</div>
-        <div class="sub">${x.pctPortfolio?`<b style="color:var(--txt)">${(x.pctPortfolio*100).toFixed(1)}%</b> · `:''}${(x.shares||0).toLocaleString()} sh · ${x.class||''}${x.putCall?' · '+x.putCall:''}</div></div>
+      <div class="tkr">${x.ticker||tkr(x.name)}</div>
+      <div class="grow"><div class="nm">${x.name}${x.ticker?` <span style="color:var(--acc);font-weight:700">${x.ticker}</span>`:''}</div>
+        <div class="sub">${x.pctPortfolio?`<b style="color:var(--txt)">${(x.pctPortfolio*100).toFixed(1)}%</b> · `:''}${(x.shares||0).toLocaleString()} sh · ${x.class||''}${x.putCall?' · '+x.putCall:''}</div>
+        ${meta2}</div>
       <div class="right"><div class="val">${fmt(x.value)}</div>
         <span class="badge b-${x.status}">${x.status}</span>${p}</div>
     </div>`;});
   h+=`</div><div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0 4px">
-     Source: SEC EDGAR 13F-HR. Values per filing. Changes vs prior quarter by shares held.</div>`;
+     13F holdings from SEC EDGAR. Sector & shares outstanding from SEC; 12-mo return from market prices (approx).</div>`;
   app.innerHTML=h;
 }
 function setFilter(f){filter=f;drawFund(curFund.demo);}
@@ -1048,6 +1198,15 @@ def _holdings(cik):
         return jsonify(build_fund_payload(cik, period))
     except Exception as e:
         return jsonify({"error": "Could not load from EDGAR: %s" % e, "cik": cik})
+
+@app.route("/api/enrich/<cik>")
+def _enrich(cik):
+    """Live-fetch sector / shares-outstanding / 12m-return for a fund's holdings."""
+    period = request.args.get("period", "").strip() or None
+    try:
+        return jsonify(enrich_fund(str(cik).zfill(10), period))
+    except Exception as e:
+        return jsonify({"error": str(e), "cik": cik})
 
 @app.route("/api/stock")
 def _stock():
