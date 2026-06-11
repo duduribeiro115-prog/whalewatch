@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: whalewatch
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn whalewatch:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    envVars:
+      - key: SEC_UA
+        value: "WhaleWatch/1.0 (Eduardo Ribeiro eduardoribeiro@uchicago.edu)"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
