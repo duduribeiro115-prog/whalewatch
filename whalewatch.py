@@ -151,6 +151,50 @@ def value_multiplier(report_date):
     except ValueError:
         return 1000.0
 
+def _median(xs):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return None
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2.0
+
+def apply_value_units(raw):
+    """Normalize 13F 'value' to whole dollars by DETECTING the unit from the data,
+    not the filing date. Within one filing, implied price = value/shares. If values
+    are in thousands, the median implied price is ~1/1000 of a real share price
+    (e.g. ~$0.25 instead of $254), so we multiply by 1000. Robust to filers who
+    ignore the 2023 whole-dollar rule in either direction."""
+    implied = [h["value"] / h["shares"] for h in raw
+               if h.get("shares") and h.get("value") and h["shares"] > 0 and h["value"] > 0]
+    m = _median(implied)
+    mult = 1000.0 if (m is not None and m < 1.0) else 1.0
+    return [{**h, "value": h["value"] * mult} for h in raw]
+
+def migrate_fix_values():
+    """One-time, idempotent repair of already-stored values that were normalized
+    with the old date-based rule. Per filing: if the median implied price is wildly
+    high (a dollars filing wrongly x1000'd) divide by 1000; if wildly low (a
+    thousands filing left as-is) multiply by 1000. Normal filings are left untouched."""
+    con = connect()
+    try:
+        accs = [r["accession"] for r in con.execute("SELECT DISTINCT accession FROM holdings").fetchall()]
+        fixed = 0
+        for acc in accs:
+            rows = con.execute("SELECT shares,value FROM holdings WHERE accession=? AND shares>0 AND value>0",
+                               (acc,)).fetchall()
+            implied = [r["value"] / r["shares"] for r in rows]
+            m = _median(implied)
+            if m is None:
+                continue
+            factor = 0.001 if m > 20000 else (1000.0 if m < 1.0 else None)
+            if factor:
+                con.execute("UPDATE holdings SET value=value*? WHERE accession=?", (factor, acc))
+                fixed += 1
+        con.commit()
+        return fixed
+    finally:
+        con.close()
+
 # ---------------------------------------------------------------------------
 # Ticker <-> company name (so users can search "AAPL" or "Apple")
 # 13F filings have NO ticker, only issuer name. SEC publishes a free
@@ -554,8 +598,7 @@ def ensure_ingested(cik, accession, form, filing_date, report_date):
     if has_filing(accession):
         return
     raw = fetch_info_table(cik, accession)
-    mult = value_multiplier(report_date)
-    agg = aggregate([{**h, "value": h["value"] * mult} for h in raw])
+    agg = aggregate(apply_value_units(raw))
     save_filing(cik, accession, form, filing_date, report_date, list(agg.values()))
 
 def ingest_fund(cik, max_filings=2, force=False):
@@ -572,8 +615,7 @@ def ingest_fund(cik, max_filings=2, force=False):
             raw = fetch_info_table(cik, f["accession"])
         except Exception as e:
             sys.stderr.write("  ! %s %s: %s\n" % (cik, f["accession"], e)); continue
-        mult = value_multiplier(f["reportDate"])
-        agg = aggregate([{**h, "value": h["value"] * mult} for h in raw])
+        agg = aggregate(apply_value_units(raw))
         save_filing(cik, f["accession"], f["form"], f["filingDate"], f["reportDate"], list(agg.values()))
         new += 1
     return new
@@ -805,6 +847,9 @@ def fund_highlights(cik):
 def refresh():
     init_schema()
     print("[%s] refresh start" % dt.datetime.now().isoformat(timespec="seconds"))
+    n = migrate_fix_values()
+    if n:
+        print("  repaired value units in %d filing(s)" % n)
     seen = build_directory(2)
     funds = funds_needing_refresh(); updated = 0
     for f in funds:
@@ -1322,6 +1367,10 @@ SAMPLE_JSON = r"""{
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 init_schema()  # ensure tables exist whether launched via dev server or gunicorn
+try:
+    migrate_fix_values()  # repair any value-unit errors in the stored data on boot
+except Exception:
+    pass
 
 @app.after_request
 def _cors(resp):
