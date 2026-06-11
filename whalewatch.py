@@ -452,9 +452,10 @@ def get_holdings(accession):
 
 def holders_of(cusip=None, name_like=None, limit=100):
     con = connect()
-    latest = """SELECT f.cik,f.accession FROM filings f
-        JOIN (SELECT cik,MAX(report_date) mr FROM filings GROUP BY cik) m
-        ON f.cik=m.cik AND f.report_date=m.mr"""
+    latest = """SELECT cik,accession FROM (
+        SELECT cik,accession,
+          ROW_NUMBER() OVER (PARTITION BY cik ORDER BY report_date DESC, accession DESC) rn
+        FROM filings) WHERE rn=1"""
     where, params = [], []
     if cusip: where.append("h.cusip=?"); params.append(cusip.upper())
     if name_like: where.append("h.name LIKE ? COLLATE NOCASE"); params.append("%" + name_like + "%")
@@ -479,9 +480,11 @@ def stock_holders(cusip, shares_out=None, limit=100):
     % of that fund's portfolio, and filing date."""
     cusip = cusip.upper()
     con = connect()
-    latest = """SELECT f.cik,f.accession,f.report_date FROM filings f
-        JOIN (SELECT cik,MAX(report_date) mr FROM filings GROUP BY cik) m
-        ON f.cik=m.cik AND f.report_date=m.mr"""
+    # exactly ONE filing per fund (newest; amendment wins on ties) — avoids dup rows
+    latest = """SELECT cik,accession,report_date FROM (
+        SELECT cik,accession,report_date,
+          ROW_NUMBER() OVER (PARTITION BY cik ORDER BY report_date DESC, accession DESC) rn
+        FROM filings) WHERE rn=1"""
     rows = con.execute("""SELECT h.shares,h.value,fn.name AS fund,h.cik,l.accession,l.report_date
         FROM holdings h JOIN (%s) l ON h.accession=l.accession
         JOIN funds fn ON fn.cik=h.cik WHERE h.cusip=?
@@ -612,8 +615,17 @@ def build_fund_payload(cik, period=None):
             "current": {"form": curr["form"], "filingDate": curr["filing_date"], "reportDate": curr["report_date"]},
             "previous": ({"reportDate": prev["report_date"]} if prev else None),
             "totalValue": total, "positions": len(active), "holdings": holdings,
-            "periods": [{"reportDate": f["report_date"], "accession": f["accession"]} for f in cat],
+            "periods": _dedupe_periods(cat),
             "selectedPeriod": curr["report_date"]}
+
+def _dedupe_periods(cat):
+    seen, out = set(), []
+    for f in cat:  # newest first; keep first (latest accession) per report date
+        if f["report_date"] in seen:
+            continue
+        seen.add(f["report_date"])
+        out.append({"reportDate": f["report_date"], "accession": f["accession"]})
+    return out
 
 def _attach_cached_enrichment(h):
     """Add ticker/sector/sharesOutstanding/pctOwnership/ret12m from cache (if any)."""
@@ -880,16 +892,16 @@ HTML = r"""<!DOCTYPE html>
   .pct{font-size:12px;font-weight:600;margin-top:3px}
   .up{color:var(--green)} .dn{color:var(--red)}
   .scrollx{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:var(--r);background:var(--card)}
-  .htbl{width:100%;border-collapse:collapse;font-size:13px;min-width:560px}
-  .htbl th{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);font-weight:600;text-align:right;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--card)}
-  .htbl th.l{text-align:left}
-  .htbl td{padding:10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;vertical-align:middle}
-  .htbl td.l{text-align:left}
+  .htbl{width:100%;border-collapse:collapse;font-size:12.5px;min-width:520px}
+  .htbl th{font-size:9.5px;text-transform:uppercase;letter-spacing:.03em;color:var(--mut);font-weight:600;text-align:right;padding:8px 9px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--card);z-index:2}
+  .htbl th.l{text-align:left;left:0;z-index:3}
+  .htbl td{padding:9px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;vertical-align:middle}
+  .htbl td.l{text-align:left;position:sticky;left:0;background:var(--card);max-width:170px;overflow:hidden;text-overflow:ellipsis}
   .htbl tr{cursor:pointer}
-  .htbl tbody tr:hover{background:var(--bg2)}
+  .htbl tbody tr:hover td{background:var(--bg2)}
   .htbl tr:last-child td{border-bottom:none}
-  .cellnm{font-weight:600;font-size:13.5px}
-  .cellsub{font-size:11px;color:var(--mut);margin-top:1px}
+  .cellnm{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis}
+  .cellsub{font-size:10.5px;color:var(--mut);margin-top:1px}
   .filterbar{display:flex;gap:7px;overflow-x:auto;padding:4px 0 2px;margin:8px 0;-ms-overflow-style:none;scrollbar-width:none}
   .filterbar::-webkit-scrollbar{display:none}
   .back{display:inline-flex;align-items:center;gap:6px;color:var(--mut);font-size:14px;cursor:pointer;margin-bottom:10px}
