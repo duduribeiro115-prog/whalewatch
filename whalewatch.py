@@ -360,7 +360,7 @@ def _cached_security(cusip):
     con.close()
     return dict(r) if r else None
 
-def enrich_security(cusip, name, max_price_age_days=1):
+def enrich_security(cusip, name, max_price_age_days=7):
     """Resolve ticker/cik, fetch sector + shares outstanding + 12m return; cache."""
     cusip = (cusip or "").upper()
     cached = _cached_security(cusip)
@@ -892,6 +892,27 @@ def fund_highlights(cik):
         "topExit": ({"name": exit_["name"], "status": exit_["status"]} if exit_ else None),
     }
 
+def enrich_held(limit=1200):
+    """Enrich (sector / shares outstanding / 12-mo return) every distinct security
+    held by an ingested fund and CACHE it in the DB, so the app serves these columns
+    instantly instead of fetching them live on each page open. Run by the nightly job."""
+    con = connect()
+    rows = con.execute("""SELECT DISTINCT h.cusip, h.name FROM holdings h
+        JOIN funds f ON f.cik=h.cik
+        WHERE f.holdings_status='ingested' AND h.cusip IS NOT NULL AND h.cusip!=''
+        LIMIT ?""", (limit,)).fetchall()
+    con.close()
+    done = 0
+    for i, r in enumerate(rows, 1):
+        try:
+            enrich_security(r["cusip"], r["name"])
+            done += 1
+        except Exception:
+            pass
+        if i % 100 == 0:
+            print("  ...enriched %d/%d securities" % (i, len(rows)))
+    return done
+
 def refresh():
     init_schema()
     print("[%s] refresh start" % dt.datetime.now().isoformat(timespec="seconds"))
@@ -907,6 +928,9 @@ def refresh():
                 # NOTE: fire push/email alert to watchers here.
         except Exception as e:
             sys.stderr.write("  ! %s: %s\n" % (f["cik"], e))
+    print("  enriching held securities (sector / shares out / 12-mo return)…")
+    en = enrich_held()
+    print("  cached enrichment for %d securities" % en)
     total, ing = count_funds()
     print("[done] %d funds, %d with holdings (%d updated)" % (total, ing, updated))
 
