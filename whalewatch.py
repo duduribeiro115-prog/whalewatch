@@ -1035,7 +1035,7 @@ function renderHome(){
     if(!hl.ua_ok){e.innerHTML=`⚠️ <b>SEC_UA not set</b> — clicks will fail. <a onclick="runHealth()">Fix it</a>`;e.style.color='var(--amber)';}
     else if(!hl.edgar_reachable){e.innerHTML=`⚠️ <b>Can't reach EDGAR.</b> <a onclick="runHealth()">Details</a>`;e.style.color='var(--amber)';}
     else if(!hl.directory_built){e.innerHTML=`📒 Directory empty — run <code>python build_directory.py</code>. Search still works live.`;}
-    else{e.innerHTML=`📒 <b>${hl.funds.toLocaleString()}</b> funds searchable · ${hl.ingested.toLocaleString()} with holdings loaded`;}
+    else{e.innerHTML=`📒 <b>${hl.funds.toLocaleString('en-US')}</b> funds searchable · ${hl.ingested.toLocaleString('en-US')} with holdings loaded`;}
   }).catch(()=>{const e=$('#dirstat');if(e){e.innerHTML=`⚠️ Backend not reachable. Open <b>http://localhost:8000</b> (not the .html file). <a onclick="runHealth()">Recheck</a>`;e.style.color='var(--amber)';}});
 }
 function fundCard(f){const on=inWatch(f.cik);const dot=f.ingested?' <span style="color:var(--green)">●</span>':'';
@@ -1050,7 +1050,7 @@ function fundCard(f){const on=inWatch(f.cik);const dot=f.ingested?' <span style=
 function renderStocksHome(){
   api('/api/stats').then(s=>{
     const note=s.ingested>0
-      ?`Searching across <b>${s.ingested.toLocaleString()}</b> funds with loaded holdings.`
+      ?`Searching across <b>${s.ingested.toLocaleString('en-US')}</b> funds with loaded holdings.`
       :`No fund holdings loaded yet. Run <code>python3 whalewatch.py preload</code> in Terminal to load the big funds, then refresh.`;
     app.innerHTML=`<div class="banner">Pick a stock to see <b>which funds hold it</b> and who's buying or selling. ${note}</div>
       <div class="empty"><div class="big">📈</div>Type a company name above<br>e.g. Apple, Nvidia, Coca-Cola.</div>`;
@@ -1108,7 +1108,7 @@ async function openStock(cusip,name){window.scrollTo(0,0);
         let chg='—', chgpct='—';
         if(r.status==='NEW'){chg=`<span class="up">NEW</span>`;chgpct=`<span class="up">new</span>`;}
         else if(r.changeShares!=null){
-          chg=`<span class="${r.changeShares>=0?'up':'dn'}">${r.changeShares>=0?'+':''}${Math.round(r.changeShares).toLocaleString()}</span>`;
+          chg=`<span class="${r.changeShares>=0?'up':'dn'}">${r.changeShares>=0?'+':''}${Math.round(r.changeShares).toLocaleString('en-US')}</span>`;
           chgpct=(r.changePct!=null)?`<span class="${r.changePct>=0?'up':'dn'}">${pct(r.changePct)}</span>`:'—';
         }
         const shOut=r.pctSharesOut!=null?`${(r.pctSharesOut*100).toFixed(r.pctSharesOut<0.01?2:1)}%`:`<span class="muted">—</span>`;
@@ -1117,7 +1117,7 @@ async function openStock(cusip,name){window.scrollTo(0,0);
           <td class="l"><div class="cellnm">${r.fund}</div><div class="cellsub">tap → fund's 13F</div></td>
           <td>${fmt(r.value)}</td>
           <td>${shOut}</td>
-          <td>${Math.round(r.shares||0).toLocaleString()}</td>
+          <td>${Math.round(r.shares||0).toLocaleString('en-US')}</td>
           <td>${chg}</td>
           <td>${chgpct}</td>
           <td>${port}</td>
@@ -1125,11 +1125,11 @@ async function openStock(cusip,name){window.scrollTo(0,0);
         </tr>`;});
       out+=`</tbody></table></div>`;
     }
-    out+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0">Across funds whose 13F is loaded. % Sh Out needs company share data (shown when available).</div>`;
+    out+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0">Value in USD ($K/$M/$B). <b>#&nbsp;Shares and Δ&nbsp;Shares are exact share counts</b> (not thousands/millions). Across funds whose 13F is loaded; % Sh Out shown when company share data is available.</div>`;
     app.innerHTML=out;
   }catch(e){app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span>`+errBox(false,e.message);}
 }
-function fmtShares(n){n=+n||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(1)+'M';return n.toLocaleString();}
+function fmtShares(n){n=+n||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(1)+'M';return n.toLocaleString('en-US');}
 
 function evt(e){e.stopPropagation();}
 function star(cik,name){toggleWatch({cik,name});setTab(tab);}
@@ -1220,7 +1220,7 @@ function drawFund(demo){
       const por=x.pctPortfolio?`${(x.pctPortfolio*100).toFixed(1)}%`:`<span class="muted">—</span>`;
       h+=`<tr onclick="openStock('${x.cusip}','${(x.name||'').replace(/'/g,'')}')">
         <td class="l"><div class="cellnm">${x.ticker?`<span style="color:var(--acc)">${x.ticker}</span> · `:''}${x.name}</div>
-          <div class="cellsub">${x.sector?x.sector+' · ':''}${(x.shares||0).toLocaleString()} sh</div></td>
+          <div class="cellsub">${x.sector?x.sector+' · ':''}${(x.shares||0).toLocaleString('en-US')} sh</div></td>
         <td>${fmt(x.value)}</td>
         <td>${por}</td>
         <td>${own}</td>
@@ -1230,7 +1230,7 @@ function drawFund(demo){
     h+=`</tbody></table></div>`;
   }
   h+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0 4px">
-     13F holdings from SEC EDGAR. Sector & shares outstanding from SEC; 12-mo return from market prices (approx).</div>`;
+     Mkt Value in USD ($K/$M/$B); share counts under each name are exact. 13F from SEC EDGAR; sector & shares outstanding from SEC; 12-mo return from market prices (approx).</div>`;
   app.innerHTML=h;
 }
 function setFilter(f){filter=f;drawFund(curFund.demo);}
