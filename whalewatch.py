@@ -394,7 +394,10 @@ def enrich_security(cusip, name, max_price_age_days=7):
             fresh_price = age.days < max_price_age_days
         except Exception:
             pass
-    if cached and cached.get("sector") is not None and fresh_price:
+    # Only skip re-resolving if we already have a real ticker AND fresh price.
+    # (A blank/unmatched cache must be retried — that was the bug that left
+    #  names like "BANK AMERICA CORP" permanently empty.)
+    if cached and cached.get("ticker") and cached.get("sector") and fresh_price:
         return cached
 
     ticker = (cached or {}).get("ticker") or ticker_for(name, cusip)
@@ -743,8 +746,9 @@ def _dedupe_periods(cat):
 
 def _attach_cached_enrichment(h):
     """Add ticker/sector/sharesOutstanding/pctOwnership/ret12m from cache (if any)."""
-    sec = _cached_security((h.get("cusip") or "").upper())
-    h["ticker"] = (sec or {}).get("ticker")
+    cu = (h.get("cusip") or "").upper()
+    sec = _cached_security(cu)
+    h["ticker"] = (sec or {}).get("ticker") or CUSIP_TICKER.get(cu) or ticker_for(h.get("name", ""), cu)
     h["sector"] = (sec or {}).get("sector") or None
     so = (sec or {}).get("shares_out")
     h["sharesOutstanding"] = so
@@ -1579,7 +1583,8 @@ def _stock():
         sec = _cached_security(cusip.upper()) or {}
         shares_out = sec.get("shares_out")
         holders = stock_holders(cusip, shares_out=shares_out)
-        return jsonify({"security": name, "cusip": cusip, "ticker": sec.get("ticker") or ticker_for(name),
+        return jsonify({"security": name, "cusip": cusip,
+                        "ticker": sec.get("ticker") or CUSIP_TICKER.get(cusip.upper()) or ticker_for(name, cusip),
                         "sector": sec.get("sector") or None, "sharesOutstanding": shares_out,
                         "ret12m": sec.get("ret_12m"),
                         "holders": holders, "count": len(holders)})
