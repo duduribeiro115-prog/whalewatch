@@ -232,7 +232,8 @@ def diff(curr_rows, prev_rows):
     for k, p in prev_rows.items():
         if k not in curr_rows:
             rows.append({**p, "shares": 0.0, "status": "SOLD", "sharesChangePct": -1.0})
-    rows.sort(key=lambda r: r["value"], reverse=True)
+    # current holdings first (by value, like Wisdom Whale); sold-out at the bottom
+    rows.sort(key=lambda r: (r["status"] == "SOLD", -r["value"]))
     return rows
 
 # ---------------------------------------------------------------------------
@@ -257,6 +258,10 @@ def init_schema():
     CREATE TABLE IF NOT EXISTS holdings (
         id INTEGER PRIMARY KEY AUTOINCREMENT, accession TEXT NOT NULL, cik TEXT NOT NULL,
         report_date TEXT, cusip TEXT, name TEXT, class TEXT, value REAL, shares REAL, put_call TEXT);
+    CREATE TABLE IF NOT EXISTS fund_filings (
+        accession TEXT PRIMARY KEY, cik TEXT NOT NULL, form TEXT,
+        filing_date TEXT, report_date TEXT);
+    CREATE INDEX IF NOT EXISTS idx_catalog_cik    ON fund_filings(cik);
     CREATE INDEX IF NOT EXISTS idx_funds_name     ON funds(name);
     CREATE INDEX IF NOT EXISTS idx_filings_cik    ON filings(cik);
     CREATE INDEX IF NOT EXISTS idx_holdings_cusip ON holdings(cusip);
@@ -369,10 +374,49 @@ def distinct_securities(q, limit=20):
 # ---------------------------------------------------------------------------
 # Ingest + payload
 # ---------------------------------------------------------------------------
+def record_catalog(cik, filings_list):
+    """Store metadata for ALL of a fund's 13F filings (not the holdings) so the
+    period dropdown can list every quarter without re-hitting EDGAR."""
+    cik = str(cik).zfill(10)
+    con = connect()
+    con.executemany("""INSERT OR REPLACE INTO fund_filings
+        (accession,cik,form,filing_date,report_date) VALUES (?,?,?,?,?)""",
+        [(f["accession"], cik, f["form"], f["filingDate"], f["reportDate"]) for f in filings_list])
+    con.commit(); con.close()
+
+def get_catalog(cik):
+    """All known 13F filings for a fund, newest first."""
+    con = connect()
+    rows = con.execute("""SELECT accession,form,filing_date,report_date FROM fund_filings
+        WHERE cik=? ORDER BY report_date DESC, filing_date DESC""", (str(cik).zfill(10),)).fetchall()
+    con.close(); return [dict(r) for r in rows]
+
+def ensure_catalog(cik):
+    """Make sure the filing catalog exists; fetch from EDGAR once if empty."""
+    cat = get_catalog(cik)
+    if cat:
+        return cat
+    info = list_13f_filings(cik)
+    upsert_fund(cik, info["name"])
+    if info["filings"]:
+        record_catalog(cik, info["filings"])
+    return get_catalog(cik)
+
+def ensure_ingested(cik, accession, form, filing_date, report_date):
+    """Ingest one specific filing's holdings if we don't already have them."""
+    if has_filing(accession):
+        return
+    raw = fetch_info_table(cik, accession)
+    mult = value_multiplier(report_date)
+    agg = aggregate([{**h, "value": h["value"] * mult} for h in raw])
+    save_filing(cik, accession, form, filing_date, report_date, list(agg.values()))
+
 def ingest_fund(cik, max_filings=2, force=False):
     cik = str(cik).zfill(10)
     info = list_13f_filings(cik)
     upsert_fund(cik, info["name"])
+    if info["filings"]:
+        record_catalog(cik, info["filings"])  # remember every quarter for the dropdown
     new = 0
     for f in info["filings"][:max_filings]:
         if not force and has_filing(f["accession"]):
@@ -387,25 +431,44 @@ def ingest_fund(cik, max_filings=2, force=False):
         new += 1
     return new
 
-def build_fund_payload(cik):
+def build_fund_payload(cik, period=None):
+    """Holdings + QoQ for one quarter. period = a reportDate or accession; default = latest."""
     cik = str(cik).zfill(10)
     fund = get_fund(cik) or {"name": cik, "cik": cik}
-    filings = get_fund_filings(cik)
-    if not filings:
-        return {"error": "No 13F-HR holdings found", "name": fund["name"], "cik": cik}
-    curr = filings[0]
+    cat = ensure_catalog(cik)
+    if not cat:
+        return {"error": "No 13F-HR filings found", "name": fund["name"], "cik": cik}
+    # pick the selected quarter (default newest)
+    curr = None
+    if period:
+        curr = next((f for f in cat if f["report_date"] == period or f["accession"] == period), None)
+    if curr is None:
+        curr = cat[0]
+    idx = cat.index(curr)
+    prev = cat[idx + 1] if idx + 1 < len(cat) else None
+    # make sure the holdings for current (and prior, for the diff) are loaded
+    ensure_ingested(cik, curr["accession"], curr["form"], curr["filing_date"], curr["report_date"])
+    if prev:
+        try:
+            ensure_ingested(cik, prev["accession"], prev["form"], prev["filing_date"], prev["report_date"])
+        except Exception:
+            prev = None
     curr_rows = aggregate(get_holdings(curr["accession"]))
-    if len(filings) > 1:
-        prev_rows = aggregate(get_holdings(filings[1]["accession"]))
-        holdings = diff(curr_rows, prev_rows); prev = filings[1]
+    if prev:
+        holdings = diff(curr_rows, aggregate(get_holdings(prev["accession"])))
     else:
         holdings = sorted([{**c, "status": "NEW", "sharesChangePct": None} for c in curr_rows.values()],
-                          key=lambda r: r["value"], reverse=True); prev = None
+                          key=lambda r: r["value"], reverse=True)
     active = [h for h in holdings if h["status"] != "SOLD"]
+    total = sum(h["value"] for h in active) or 0.0
+    for h in holdings:  # % of portfolio (current holdings only)
+        h["pctPortfolio"] = (h["value"] / total) if (total and h["status"] != "SOLD") else None
     return {"name": fund["name"], "cik": cik,
             "current": {"form": curr["form"], "filingDate": curr["filing_date"], "reportDate": curr["report_date"]},
             "previous": ({"reportDate": prev["report_date"]} if prev else None),
-            "totalValue": sum(h["value"] for h in active), "positions": len(active), "holdings": holdings}
+            "totalValue": total, "positions": len(active), "holdings": holdings,
+            "periods": [{"reportDate": f["report_date"], "accession": f["accession"]} for f in cat],
+            "selectedPeriod": curr["report_date"]}
 
 def build_directory(quarters=8):
     init_schema()
@@ -763,21 +826,22 @@ async function doSearch(q){
   }catch(e){app.innerHTML=errBox(false,e.message);}
 }
 
-async function openFund(cik,name){
+async function openFund(cik,name,period){
   window.scrollTo(0,0);
   app.innerHTML=`<span class="back" onclick="setTab('search')">‹ back</span><div class="spin">Loading ${name||'fund'} holdings from EDGAR…<br><span style="font-size:12px">(first open downloads from SEC — can take 5–15s)</span></div>`;
-  try{const d=await api('/api/holdings/'+cik);renderFund(d);}
+  try{const d=await api('/api/holdings/'+cik+(period?('?period='+encodeURIComponent(period)):''));renderFund(d);}
   catch(e){app.innerHTML=errBox(true,e.message);}
 }
+function qlabel(d){if(!d)return d;const p=String(d).split('-');const q={'03':'Q1','06':'Q2','09':'Q3','12':'Q4'}[p[1]]||p[1];return q+' '+p[0];}
 async function loadDemo(){window.scrollTo(0,0);
   app.innerHTML=`<div class="spin">Loading sample…</div>`;
   try{renderFund(await api('/api/demo'),true);}catch(e){app.innerHTML=`<div class="empty">Sample unavailable.</div>`;}
 }
 
-let curFund=null, filter='ALL';
+let curFund=null, filter='CURRENT';
 function renderFund(d,demo){
   if(d.error){app.innerHTML=`<span class="back" onclick="setTab('search')">‹ back</span><div class="empty"><div class="big">📭</div>${d.error} for ${d.name||''}.</div>`;return;}
-  curFund=d; filter='ALL';
+  curFund=d; filter='CURRENT';
   drawFund(demo);
 }
 function drawFund(demo){
@@ -788,8 +852,13 @@ function drawFund(demo){
   let h=`<span class="back" onclick="setTab('search')">‹ back</span>`;
   if(demo||d.demo)h+=`<div class="banner">Sample data — run <b>python app.py</b> and search to pull live filings.</div>`;
   h+=`<div class="fhead"><div class="h1">${d.name}</div>
-     <div class="muted" style="font-size:13px">13F-HR · period ending ${period} · filed ${(d.current&&d.current.filingDate)||''}</div></div>
-   <div class="stats">
+     <div class="muted" style="font-size:13px">13F-HR · period ending ${period} · filed ${(d.current&&d.current.filingDate)||''}</div></div>`;
+  if(d.periods&&d.periods.length>1){
+    h+=`<select onchange="openFund('${d.cik}','${(d.name||'').replace(/'/g,'')}',this.value)"
+      style="width:100%;margin-bottom:12px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:12px;font-size:15px;font-weight:600">
+      ${d.periods.map(p=>`<option value="${p.reportDate}" ${p.reportDate===d.selectedPeriod?'selected':''}>${qlabel(p.reportDate)} (${p.reportDate})</option>`).join('')}</select>`;
+  }
+  h+=`<div class="stats">
      <div class="stat"><div class="k">Portfolio value</div><div class="v">${fmt(d.totalValue)}</div></div>
      <div class="stat"><div class="k">Positions</div><div class="v">${d.positions}</div></div>
    </div>
@@ -798,13 +867,14 @@ function drawFund(demo){
    <button class="alertbtn ${on?'on':''}" style="margin-top:8px" onclick="star('${d.cik}','${(d.name||'').replace(/'/g,'')}');drawFund(${demo?true:false})">
      ${on?'★ In your watchlist':'☆ Add to watchlist'}</button>`;
   // filters
-  const fl=['ALL','NEW','ADDED','TRIMMED','SOLD','HOLD'];
-  h+=`<div class="filterbar">`+fl.map(f=>{const n=f==='ALL'?d.holdings.length:(counts[f]||0);
-     return `<span class="chip ${filter===f?'on':''}" onclick="setFilter('${f}')">${f}${f!=='ALL'?' '+n:''}</span>`;}).join('')+`</div>`;
-  // rows
+  const active=d.holdings.length-(counts.SOLD||0);
+  const fl=['CURRENT','NEW','ADDED','TRIMMED','SOLD','HOLD'];
+  h+=`<div class="filterbar">`+fl.map(f=>{const n=f==='CURRENT'?active:(counts[f]||0);
+     return `<span class="chip ${filter===f?'on':''}" onclick="setFilter('${f}')">${f} ${n}</span>`;}).join('')+`</div>`;
+  // rows — CURRENT shows what the fund holds now (matches Wisdom Whale); SOLD lives in its own tab
   h+=`<div class="card" style="padding:4px 14px">`;
-  const rows=d.holdings.filter(x=>filter==='ALL'||x.status===filter);
-  if(!rows.length)h+=`<div class="empty" style="padding:30px">No ${filter} positions.</div>`;
+  const rows=d.holdings.filter(x=>filter==='CURRENT'?x.status!=='SOLD':x.status===filter);
+  if(!rows.length)h+=`<div class="empty" style="padding:30px">No ${filter.toLowerCase()} positions.</div>`;
   rows.forEach(x=>{
     let p='';
     if(x.status==='SOLD')p=`<div class="pct dn">sold out</div>`;
@@ -813,7 +883,7 @@ function drawFund(demo){
     h+=`<div class="hrow">
       <div class="tkr">${tkr(x.name)}</div>
       <div class="grow"><div class="nm">${x.name}</div>
-        <div class="sub">${(x.shares||0).toLocaleString()} sh · ${x.class||''} ${x.putCall?'· '+x.putCall:''}</div></div>
+        <div class="sub">${x.pctPortfolio?`<b style="color:var(--txt)">${(x.pctPortfolio*100).toFixed(1)}%</b> · `:''}${(x.shares||0).toLocaleString()} sh · ${x.class||''}${x.putCall?' · '+x.putCall:''}</div></div>
       <div class="right"><div class="val">${fmt(x.value)}</div>
         <span class="badge b-${x.status}">${x.status}</span>${p}</div>
     </div>`;});
@@ -973,13 +1043,11 @@ def _search():
 @app.route("/api/holdings/<cik>")
 def _holdings(cik):
     cik = str(cik).zfill(10)
-    fund = get_fund(cik)
-    if not fund or fund.get("holdings_status") != "ingested":
-        try:
-            ingest_fund(cik, 2)
-        except Exception as e:
-            return jsonify({"error": "Could not load from EDGAR: %s" % e, "cik": cik})
-    return jsonify(build_fund_payload(cik))
+    period = request.args.get("period", "").strip() or None
+    try:
+        return jsonify(build_fund_payload(cik, period))
+    except Exception as e:
+        return jsonify({"error": "Could not load from EDGAR: %s" % e, "cik": cik})
 
 @app.route("/api/stock")
 def _stock():
