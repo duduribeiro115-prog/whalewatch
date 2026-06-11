@@ -251,11 +251,28 @@ _SUFFIX = {"INC", "INCORPORATED", "CORP", "CORPORATION", "CO", "COMPANY", "LTD",
            "HLDGS", "HLDG", "HOLDING", "GROUP", "GRP", "TRUST", "CLASS", "CL",
            "COM", "COMMON", "SHARES", "ADR", "ADS", "NEW", "SPONSORED", "PAR"}
 
+# Common 13F name abbreviations expanded to the full words SEC's official ticker
+# list uses, so e.g. "RESTAURANT BRANDS INTL" matches "Restaurant Brands
+# International". Only well-known, low-ambiguity expansions (a wrong expansion
+# simply fails to match — names must be exactly equal after normalizing — so the
+# worst case is the same blank we already had, never a wrong ticker).
+_ABBREV = {
+    "INTL": "INTERNATIONAL", "INTERNATL": "INTERNATIONAL", "INTERNATL'": "INTERNATIONAL",
+    "ENTMT": "ENTERTAINMENT", "ENTMNT": "ENTERTAINMENT", "ENTERTAINMNT": "ENTERTAINMENT",
+    "CMNCTNS": "COMMUNICATIONS", "COMMUNICATNS": "COMMUNICATIONS", "COMMS": "COMMUNICATIONS",
+    "CMNTYS": "COMMUNITIES", "CMNTY": "COMMUNITY",
+    "FINL": "FINANCIAL", "SVCS": "SERVICES", "SVC": "SERVICES",
+    "MGMT": "MANAGEMENT", "NATL": "NATIONAL", "PETE": "PETROLEUM",
+    "HLTH": "HEALTH", "SYS": "SYSTEMS", "MTRS": "MOTORS", "TECH": "TECHNOLOGIES",
+    "PHARMACEUTICAL": "PHARMACEUTICALS", "RES": "RESOURCES",
+}
+
 def _norm(s):
     s = (s or "").upper()
     s = re.sub(r"[.'`&]", "", s)              # delete apostrophes/periods/& (MOODY'S -> MOODYS)
     s = re.sub(r"[^A-Z0-9 ]", " ", s)
-    toks = [t for t in s.split() if t and t not in _SUFFIX and len(t) > 1]
+    toks = [_ABBREV.get(t, t) for t in s.split()]            # expand known abbreviations
+    toks = [t for t in toks if t and t not in _SUFFIX and len(t) > 1]
     return " ".join(toks)
 
 # Reliable CUSIP -> ticker for common holdings whose 13F names don't match the
@@ -270,6 +287,18 @@ CUSIP_TICKER = {
     "02079K107": "GOOG", "92826C839": "V", "57636Q104": "MA", "91324P102": "UNH",
     "023135106": "AMZN", "21036P108": "STZ", "62944T105": "NVR", "670346105": "NUE",
     "526057104": "LEN", "16119P108": "CHTR", "512816109": "LAMR",
+    # Names whose 13F spelling doesn't match SEC's official list (foreign issuers,
+    # spinoffs, abbreviations). CUSIP is exact, so this is the most reliable match.
+    "11271J107": "BN",   "76131D103": "QSR",  "812215200": "SEG",
+    "90353T100": "UBER", "594918104": "MSFT", "30303M102": "META",
+    "44267T102": "HHH",  "42806J700": "HTZ",
+}
+
+# Manual shares-outstanding fallback for foreign private issuers (SEC Form 40-F)
+# that do NOT report the dei:EntityCommonStockSharesOutstanding cover-page tag,
+# so % owned can still be computed. (shares, as_of_date). Update occasionally.
+SHARES_OUT_OVERRIDE = {
+    "BN": (2450808038.0, "2026-05-15"),   # Brookfield Corp Class A (40-F; absent from SEC XBRL)
 }
 
 _TMAPS = None
@@ -410,6 +439,8 @@ def enrich_security(cusip, name, max_price_age_days=7):
         sector = _company_sic(cik)
     if cik and not shares_out:
         shares_out, shares_date = _shares_outstanding(cik)
+    if not shares_out and ticker in SHARES_OUT_OVERRIDE:   # foreign filers missing from SEC XBRL
+        shares_out, shares_date = SHARES_OUT_OVERRIDE[ticker]
     ret = _ret_12m(ticker) if ticker else None
 
     con = connect()
