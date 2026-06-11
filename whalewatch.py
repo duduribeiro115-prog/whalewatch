@@ -170,6 +170,52 @@ def apply_value_units(raw):
     mult = 1000.0 if (m is not None and m < 1.0) else 1.0
     return [{**h, "value": h["value"] * mult} for h in raw]
 
+def _snap_factor(implied, target):
+    """Power-of-1000 factor that brings `implied` closest (in ratio) to `target`."""
+    best_f, best_r = 1.0, None
+    for f in (1.0, 0.001, 1000.0, 1e-6, 1e6):
+        v = implied * f
+        if v <= 0:
+            continue
+        r = v / target if v >= target else target / v
+        if best_r is None or r < best_r:
+            best_r, best_f = r, f
+    return best_f
+
+def _snap_agg(agg):
+    """Fix value-unit errors for one filing's aggregated holdings (in place).
+    Uses the filing's median implied price; snaps all values by one 1000^k factor
+    so the median lands in a sane $1–$10,000 share-price range."""
+    imp = [d["value"] / d["shares"] for d in agg.values()
+           if d.get("shares") and d["shares"] > 0 and d.get("value") and d["value"] > 0]
+    m = _median(imp)
+    if not m or m <= 0:
+        return agg
+    factor = 1.0
+    while m * factor > 10000:
+        factor /= 1000.0
+    while m * factor < 1.0:
+        factor *= 1000.0
+    if factor != 1.0:
+        for d in agg.values():
+            if d.get("value"):
+                d["value"] *= factor
+    return agg
+
+def _snap_holders(rows):
+    """Fix value-unit errors across funds holding ONE security (in place), using
+    the consensus (median) implied price. Leaves % of portfolio untouched (that's
+    computed from raw values and is unit-invariant)."""
+    imp = [r["value"] / r["shares"] for r in rows
+           if r.get("shares") and r["shares"] > 0 and r.get("value") and r["value"] > 0]
+    cons = _median(imp)
+    if not cons or cons <= 0:
+        return rows
+    for r in rows:
+        if r.get("shares") and r["shares"] > 0 and r.get("value"):
+            r["value"] *= _snap_factor(r["value"] / r["shares"], cons)
+    return rows
+
 def migrate_fix_values():
     """One-time, idempotent repair of already-stored values that were normalized
     with the old date-based rule. Per filing: if the median implied price is wildly
@@ -560,6 +606,8 @@ def stock_holders(cusip, shares_out=None, limit=100):
             "reportDate": rd,
         })
     con.close()
+    _snap_holders(out)                       # fix any 1000x value-unit errors at read time
+    out.sort(key=lambda r: -(r["value"] or 0))  # rank by corrected value (= true position size)
     return out
 
 # ---------------------------------------------------------------------------
@@ -642,9 +690,9 @@ def build_fund_payload(cik, period=None):
             ensure_ingested(cik, prev["accession"], prev["form"], prev["filing_date"], prev["report_date"])
         except Exception:
             prev = None
-    curr_rows = aggregate(get_holdings(curr["accession"]))
+    curr_rows = _snap_agg(aggregate(get_holdings(curr["accession"])))
     if prev:
-        holdings = diff(curr_rows, aggregate(get_holdings(prev["accession"])))
+        holdings = diff(curr_rows, _snap_agg(aggregate(get_holdings(prev["accession"]))))
     else:
         holdings = sorted([{**c, "status": "NEW", "sharesChangePct": None} for c in curr_rows.values()],
                           key=lambda r: r["value"], reverse=True)
