@@ -423,10 +423,13 @@ def enrich_security(cusip, name, max_price_age_days=7):
             fresh_price = age.days < max_price_age_days
         except Exception:
             pass
-    # Only skip re-resolving if we already have a real ticker AND fresh price.
-    # (A blank/unmatched cache must be retried — that was the bug that left
-    #  names like "BANK AMERICA CORP" permanently empty.)
-    if cached and cached.get("ticker") and cached.get("sector") and fresh_price:
+    # Only skip re-resolving if we already have a real ticker, fresh price, AND
+    # shares outstanding — unless there's no CIK to look shares up from anyway.
+    # (A blank/unmatched cache, or one missing shares we could still fetch, must
+    #  be retried — that's what left names like "BANK AMERICA CORP" / "META" empty
+    #  after a transient SEC hiccup during the nightly bulk enrich.)
+    if (cached and cached.get("ticker") and cached.get("sector") and fresh_price
+            and (cached.get("shares_out") or not cached.get("cik"))):
         return cached
 
     ticker = (cached or {}).get("ticker") or ticker_for(name, cusip)
