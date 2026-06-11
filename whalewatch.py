@@ -473,6 +473,48 @@ def distinct_securities(q, limit=20):
         ORDER BY holders DESC, total DESC LIMIT ?""", ("%" + q + "%", limit)).fetchall()
     con.close(); return [dict(r) for r in rows]
 
+def stock_holders(cusip, shares_out=None, limit=100):
+    """Per-fund detail for one security (Wisdom-Whale-style columns):
+    value, shares, % of shares outstanding, change in shares (# and %),
+    % of that fund's portfolio, and filing date."""
+    cusip = cusip.upper()
+    con = connect()
+    latest = """SELECT f.cik,f.accession,f.report_date FROM filings f
+        JOIN (SELECT cik,MAX(report_date) mr FROM filings GROUP BY cik) m
+        ON f.cik=m.cik AND f.report_date=m.mr"""
+    rows = con.execute("""SELECT h.shares,h.value,fn.name AS fund,h.cik,l.accession,l.report_date
+        FROM holdings h JOIN (%s) l ON h.accession=l.accession
+        JOIN funds fn ON fn.cik=h.cik WHERE h.cusip=?
+        ORDER BY h.value DESC LIMIT ?""" % latest, (cusip, limit)).fetchall()
+    out = []
+    for r in rows:
+        cik, acc, rd = r["cik"], r["accession"], r["report_date"]
+        ftot = con.execute("SELECT SUM(value) t FROM holdings WHERE accession=?", (acc,)).fetchone()["t"] or 0.0
+        prior = con.execute("""SELECT accession FROM filings WHERE cik=? AND report_date<?
+            ORDER BY report_date DESC LIMIT 1""", (cik, rd)).fetchone()
+        prev = None
+        if prior:
+            pr = con.execute("SELECT shares FROM holdings WHERE accession=? AND cusip=?",
+                             (prior["accession"], cusip)).fetchone()
+            prev = pr["shares"] if pr else 0.0
+        chg = (r["shares"] - prev) if prev is not None else None
+        if prev is None:
+            chgpct, status = None, None
+        elif prev == 0:
+            chgpct, status = None, "NEW"
+        else:
+            chgpct = (r["shares"] - prev) / prev
+            status = "HOLD" if abs(chgpct) < 1e-9 else ("ADDED" if chgpct > 0 else "TRIMMED")
+        out.append({
+            "fund": r["fund"], "cik": cik, "shares": r["shares"], "value": r["value"],
+            "pctSharesOut": (r["shares"] / shares_out) if shares_out else None,
+            "changeShares": chg, "changePct": chgpct, "status": status,
+            "pctPortfolio": (r["value"] / ftot) if ftot else None,
+            "reportDate": rd,
+        })
+    con.close()
+    return out
+
 # ---------------------------------------------------------------------------
 # Ingest + payload
 # ---------------------------------------------------------------------------
@@ -1039,22 +1081,43 @@ async function openFundInfo(cik,name){window.scrollTo(0,0);
 }
 async function openStock(cusip,name){window.scrollTo(0,0);
   tab='stocks';document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.tab==='stocks'));
-  app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span><div class="spin">Loading holders…</div>`;
+  app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span><div class="spin">Loading holders & shares data…<br><span style="font-size:12px">(first load pulls company data — a few seconds)</span></div>`;
   try{const d=await api('/api/stock?cusip='+encodeURIComponent(cusip));
     const h=d.holders||[];
     let out=`<span class="back" onclick="setTab('stocks')">‹ back</span>
       <div class="fhead"><div class="h1">${d.security}${d.ticker?` <span style="color:var(--acc)">${d.ticker}</span>`:''}</div>
-      <div class="muted" style="font-size:13px">CUSIP ${cusip} · held by ${d.count} loaded fund${d.count!==1?'s':''}</div></div>
-      <div class="card" style="padding:4px 14px">`;
-    h.forEach(r=>{out+=`<div class="hrow">
-      <div class="tkr">${tkr(r.fund)}</div>
-      <div class="grow"><div class="nm">${r.fund}</div>
-        <div class="sub">${(r.shares||0).toLocaleString()} sh · as of ${r.report_date}</div></div>
-      <div class="right"><div class="val">${fmt(r.value)}</div></div></div>`;});
-    out+=`</div><div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0">Across funds whose latest 13F is loaded in your DB.</div>`;
+      <div class="muted" style="font-size:13px">CUSIP ${cusip} · held by ${d.count} loaded fund${d.count!==1?'s':''}${d.sharesOutstanding?` · ${fmtShares(d.sharesOutstanding)} shares outstanding`:''}${d.sector?' · '+d.sector:''}</div></div>`;
+    if(!h.length){out+=`<div class="card"><div class="empty" style="padding:30px">No loaded funds hold this yet.</div></div>`;}
+    else{
+      out+=`<div class="scrollx"><table class="htbl"><thead><tr>
+        <th class="l">Investor</th><th>Value</th><th>% Sh Out</th><th># Shares</th><th>Δ Shares</th><th>% Chg</th><th>% Port</th><th>Date</th>
+        </tr></thead><tbody>`;
+      h.forEach(r=>{
+        let chg='—', chgpct='—';
+        if(r.status==='NEW'){chg=`<span class="up">NEW</span>`;chgpct=`<span class="up">new</span>`;}
+        else if(r.changeShares!=null){
+          chg=`<span class="${r.changeShares>=0?'up':'dn'}">${r.changeShares>=0?'+':''}${Math.round(r.changeShares).toLocaleString()}</span>`;
+          chgpct=(r.changePct!=null)?`<span class="${r.changePct>=0?'up':'dn'}">${pct(r.changePct)}</span>`:'—';
+        }
+        const shOut=r.pctSharesOut!=null?`${(r.pctSharesOut*100).toFixed(r.pctSharesOut<0.01?2:1)}%`:`<span class="muted">—</span>`;
+        const port=r.pctPortfolio!=null?`${(r.pctPortfolio*100).toFixed(1)}%`:`<span class="muted">—</span>`;
+        out+=`<tr onclick="openFund('${r.cik}','${(r.fund||'').replace(/'/g,'')}')">
+          <td class="l"><div class="cellnm">${r.fund}</div><div class="cellsub">tap → fund's 13F</div></td>
+          <td>${fmt(r.value)}</td>
+          <td>${shOut}</td>
+          <td>${Math.round(r.shares||0).toLocaleString()}</td>
+          <td>${chg}</td>
+          <td>${chgpct}</td>
+          <td>${port}</td>
+          <td>${r.reportDate}</td>
+        </tr>`;});
+      out+=`</tbody></table></div>`;
+    }
+    out+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0">Across funds whose 13F is loaded. % Sh Out needs company share data (shown when available).</div>`;
     app.innerHTML=out;
-  }catch(e){app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span><div class="empty">Couldn't load holders.</div>`;}
+  }catch(e){app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span>`+errBox(false,e.message);}
 }
+function fmtShares(n){n=+n||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(1)+'M';return n.toLocaleString();}
 
 function evt(e){e.stopPropagation();}
 function star(cik,name){toggleWatch({cik,name});setTab(tab);}
@@ -1337,9 +1400,19 @@ def _stock():
     cusip = request.args.get("cusip", "").strip()
     q = request.args.get("q", "").strip()
     if cusip:
-        holders = holders_of(cusip=cusip)
-        name = holders[0]["security"] if holders else cusip
-        return jsonify({"security": name, "cusip": cusip, "ticker": ticker_for(name),
+        base = holders_of(cusip=cusip)
+        name = base[0]["security"] if base else cusip
+        # enrich the security once to get shares outstanding (for % of shares out)
+        try:
+            enrich_security(cusip, name)
+        except Exception:
+            pass
+        sec = _cached_security(cusip.upper()) or {}
+        shares_out = sec.get("shares_out")
+        holders = stock_holders(cusip, shares_out=shares_out)
+        return jsonify({"security": name, "cusip": cusip, "ticker": sec.get("ticker") or ticker_for(name),
+                        "sector": sec.get("sector") or None, "sharesOutstanding": shares_out,
+                        "ret12m": sec.get("ret_12m"),
                         "holders": holders, "count": len(holders)})
     if q:
         # If the query is a ticker (e.g. AAPL), search by its company name instead.
