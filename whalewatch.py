@@ -1136,44 +1136,56 @@ async function openFundInfo(cik,name){window.scrollTo(0,0);
     app.innerHTML=h;
   }catch(e){app.innerHTML=errBox(false,e.message);}
 }
+let curStock=null, stockFresh=true;
 async function openStock(cusip,name){window.scrollTo(0,0);
   tab='stocks';document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.tab==='stocks'));
   app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span><div class="spin">Loading holders & shares data…<br><span style="font-size:12px">(first load pulls company data — a few seconds)</span></div>`;
   try{const d=await api('/api/stock?cusip='+encodeURIComponent(cusip));
-    const h=d.holders||[];
-    let out=`<span class="back" onclick="setTab('stocks')">‹ back</span>
-      <div class="fhead"><div class="h1">${d.security}${d.ticker?` <span style="color:var(--acc)">${d.ticker}</span>`:''}</div>
-      <div class="muted" style="font-size:13px">CUSIP ${cusip} · held by ${d.count} loaded fund${d.count!==1?'s':''}${d.sharesOutstanding?` · ${fmtShares(d.sharesOutstanding)} shares outstanding`:''}${d.sector?' · '+d.sector:''}</div></div>`;
-    if(!h.length){out+=`<div class="card"><div class="empty" style="padding:30px">No loaded funds hold this yet.</div></div>`;}
-    else{
-      out+=`<div class="scrollx"><table class="htbl"><thead><tr>
-        <th class="l">Investor</th><th>Value</th><th>% Sh Out</th><th># Shares</th><th>Δ Shares</th><th>% Chg</th><th>% Port</th><th>Date</th>
-        </tr></thead><tbody>`;
-      h.forEach(r=>{
-        let chg='—', chgpct='—';
-        if(r.status==='NEW'){chg=`<span class="up">NEW</span>`;chgpct=`<span class="up">new</span>`;}
-        else if(r.changeShares!=null){
-          chg=`<span class="${r.changeShares>=0?'up':'dn'}">${r.changeShares>=0?'+':''}${Math.round(r.changeShares).toLocaleString('en-US')}</span>`;
-          chgpct=(r.changePct!=null)?`<span class="${r.changePct>=0?'up':'dn'}">${pct(r.changePct)}</span>`:'—';
-        }
-        const shOut=r.pctSharesOut!=null?`${(r.pctSharesOut*100).toFixed(r.pctSharesOut<0.01?2:1)}%`:`<span class="muted">—</span>`;
-        const port=r.pctPortfolio!=null?`${(r.pctPortfolio*100).toFixed(1)}%`:`<span class="muted">—</span>`;
-        out+=`<tr onclick="openFund('${r.cik}','${(r.fund||'').replace(/'/g,'')}')">
-          <td class="l"><div class="cellnm">${r.fund}</div><div class="cellsub">tap → fund's 13F</div></td>
-          <td>${fmt(r.value)}</td>
-          <td>${shOut}</td>
-          <td>${Math.round(r.shares||0).toLocaleString('en-US')}</td>
-          <td>${chg}</td>
-          <td>${chgpct}</td>
-          <td>${port}</td>
-          <td>${r.reportDate}</td>
-        </tr>`;});
-      out+=`</tbody></table></div>`;
-    }
-    out+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0">Value in USD ($K/$M/$B). <b>#&nbsp;Shares and Δ&nbsp;Shares are exact share counts</b> (not thousands/millions). Across funds whose 13F is loaded; % Sh Out shown when company share data is available.</div>`;
-    app.innerHTML=out;
+    d.cusip=d.cusip||cusip; curStock=d; stockFresh=true; drawStock();
   }catch(e){app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span>`+errBox(false,e.message);}
 }
+function freshCutoff(){const c=new Date();c.setFullYear(c.getFullYear()-1);return c.toISOString().slice(0,10);}
+function drawStock(){
+  const d=curStock; const all=d.holders||[];
+  const cut=freshCutoff();
+  const shown=stockFresh?all.filter(r=>(r.reportDate||'')>=cut):all;
+  const hidden=all.length-shown.length;
+  let out=`<span class="back" onclick="setTab('stocks')">‹ back</span>
+    <div class="fhead"><div class="h1">${d.security}${d.ticker?` <span style="color:var(--acc)">${d.ticker}</span>`:''}</div>
+    <div class="muted" style="font-size:13px">CUSIP ${d.cusip} · held by ${d.count} loaded fund${d.count!==1?'s':''}${d.sharesOutstanding?` · ${fmtShares(d.sharesOutstanding)} shares outstanding`:''}${d.sector?' · '+d.sector:''}</div></div>`;
+  out+=`<div class="filterbar"><span class="chip ${stockFresh?'on':''}" onclick="stockFresh=true;drawStock()">Recent filers (last 1y)</span>
+    <span class="chip ${stockFresh?'':'on'}" onclick="stockFresh=false;drawStock()">All filers ${all.length}</span>
+    ${stockFresh&&hidden>0?`<span class="muted" style="align-self:center;font-size:11.5px">${hidden} stale hidden</span>`:''}</div>`;
+  if(!shown.length){out+=`<div class="card"><div class="empty" style="padding:30px">${all.length&&stockFresh?'No holders filed in the last year. ':''}No loaded funds hold this${all.length?' recently':' yet'}.</div></div>`;}
+  else{
+    out+=`<div class="scrollx"><table class="htbl"><thead><tr>
+      <th class="l">Investor</th><th>Value</th><th>% Sh Out</th><th># Shares</th><th>Δ Shares</th><th>% Chg</th><th>% Port</th><th>Date</th>
+      </tr></thead><tbody>`;
+    shown.forEach(r=>{
+      let chg='—', chgpct='—';
+      if(r.status==='NEW'){chg=`<span class="up">NEW</span>`;chgpct=`<span class="up">new</span>`;}
+      else if(r.changeShares!=null){
+        chg=`<span class="${r.changeShares>=0?'up':'dn'}">${r.changeShares>=0?'+':''}${Math.round(r.changeShares).toLocaleString('en-US')}</span>`;
+        chgpct=(r.changePct!=null)?`<span class="${r.changePct>=0?'up':'dn'}">${pct(r.changePct)}</span>`:'—';
+      }
+      const shOut=r.pctSharesOut!=null?`${(r.pctSharesOut*100).toFixed(r.pctSharesOut<0.01?2:1)}%`:`<span class="muted">—</span>`;
+      const port=r.pctPortfolio!=null?`${(r.pctPortfolio*100).toFixed(1)}%`:`<span class="muted">—</span>`;
+      out+=`<tr onclick="openFund('${r.cik}','${(r.fund||'').replace(/'/g,'')}')">
+        <td class="l"><div class="cellnm">${r.fund}</div><div class="cellsub">tap → fund's 13F</div></td>
+        <td>${fmt(r.value)}</td>
+        <td>${shOut}</td>
+        <td>${Math.round(r.shares||0).toLocaleString('en-US')}</td>
+        <td>${chg}</td>
+        <td>${chgpct}</td>
+        <td>${port}</td>
+        <td>${r.reportDate}</td>
+      </tr>`;});
+    out+=`</tbody></table></div>`;
+  }
+  out+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0">Value in USD ($K/$M/$B). <b>#&nbsp;Shares and Δ&nbsp;Shares are exact share counts</b> (not thousands/millions). "Recent" = latest 13F within the last year; % Sh Out shown when company share data is available.</div>`;
+  app.innerHTML=out;
+}
+function fmtShares(n){n=+n||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(1)+'M';return n.toLocaleString('en-US');}
 function fmtShares(n){n=+n||0;if(n>=1e9)return (n/1e9).toFixed(2)+'B';if(n>=1e6)return (n/1e6).toFixed(1)+'M';return n.toLocaleString('en-US');}
 
 function evt(e){e.stopPropagation();}
