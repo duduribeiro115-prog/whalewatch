@@ -598,6 +598,85 @@ def enrich_fund(cik, period=None, cap=40):
             continue
     return build_fund_payload(cik, period)  # rebuild with freshly cached values
 
+# Hand-written profiles for well-known managers. Matched by NAME (not CIK) so a
+# blurb can never attach to the wrong fund. Extend freely.
+CURATED_FUNDS = [
+    ("BERKSHIRE", "berkshirehathaway.com",
+     "Warren Buffett's holding company. Long-term, concentrated value investing in high-quality, cash-generative businesses; very low turnover.",
+     "Warren Buffett (Chairman & CEO), Greg Abel (Vice Chairman, successor), Todd Combs & Ted Weschler (investment managers)"),
+    ("SCION", None,
+     "Michael Burry's fund. Deep-value, contrarian, often concentrated single-name and macro bets; known for the 2008 'Big Short'.",
+     "Michael Burry (Founder)"),
+    ("PERSHING SQUARE", "pershingsquareholdings.com",
+     "Bill Ackman's concentrated activist fund. Holds a handful of large-cap quality businesses and pushes for change.",
+     "Bill Ackman (Founder & CEO)"),
+    ("BRIDGEWATER", "bridgewater.com",
+     "One of the world's largest hedge funds. Systematic global-macro and risk-parity strategies (e.g. All Weather).",
+     "Ray Dalio (Founder), Nir Bar Dea (CEO)"),
+    ("CITADEL", "citadel.com",
+     "Ken Griffin's multi-strategy fund spanning equities, fixed income, commodities and quant.",
+     "Ken Griffin (Founder & CEO)"),
+    ("RENAISSANCE TECH", "rentec.com",
+     "Quant pioneer founded by Jim Simons. Models-driven systematic trading (Medallion and public funds).",
+     "Peter Brown (CEO); Jim Simons (Founder, d. 2024)"),
+    ("TIGER GLOBAL", "tigerglobal.com",
+     "Growth- and technology-focused crossover fund investing across public and private markets.",
+     "Chase Coleman (Founder)"),
+    ("GREENLIGHT", "greenlightcapital.com",
+     "David Einhorn's long/short value fund, known for detailed fundamental short theses.",
+     "David Einhorn (President)"),
+    ("THIRD POINT", "thirdpoint.com",
+     "Dan Loeb's event-driven and activist fund.",
+     "Daniel Loeb (Founder & CEO)"),
+    ("BAUPOST", "baupost.com",
+     "Seth Klarman's value-oriented fund emphasizing downside protection and holding cash when opportunities are scarce.",
+     "Seth Klarman (CEO)"),
+    ("APPALOOSA", "appaloosa-llp.com",
+     "David Tepper's fund, known for opportunistic, sometimes contrarian macro and distressed bets.",
+     "David Tepper (Founder)"),
+    ("DUQUESNE", None,
+     "Stanley Druckenmiller's family office; flexible global macro and concentrated equity bets.",
+     "Stanley Druckenmiller"),
+    ("ARK INVEST", "ark-invest.com",
+     "Cathie Wood's thematic, high-conviction growth manager focused on 'disruptive innovation'.",
+     "Cathie Wood (Founder & CEO)"),
+]
+
+def _curated_profile(name):
+    up = (name or "").upper()
+    for kw, site, blurb, people in CURATED_FUNDS:
+        if kw in up:
+            return {"website": site, "blurb": blurb, "people": people}
+    return {}
+
+def fund_info(cik):
+    """Profile panel data: SEC-derived facts + links, plus a curated blurb if known."""
+    cik = str(cik).zfill(10)
+    name, location, sic = cik, None, None
+    try:
+        sub = get_submissions(cik)
+        name = sub.get("name", cik)
+        sic = sub.get("sicDescription") or None
+        b = (sub.get("addresses") or {}).get("business") or {}
+        location = ", ".join([x for x in [b.get("city"), b.get("stateOrCountry")] if x]) or None
+    except Exception:
+        f = get_fund(cik)
+        if f:
+            name = f["name"]
+    cat = get_catalog(cik)
+    prof = _curated_profile(name)
+    return {
+        "cik": cik, "name": name, "location": location, "sic": sic,
+        "filingsCount": len(cat),
+        "firstPeriod": cat[-1]["report_date"] if cat else None,
+        "latestPeriod": cat[0]["report_date"] if cat else None,
+        "edgarUrl": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=%s&type=13F" % cik,
+        "searchUrl": "https://www.google.com/search?q=" + requests.utils.quote((name or "") + " investment firm"),
+        "website": prof.get("website"),
+        "blurb": prof.get("blurb"),
+        "people": prof.get("people"),
+    }
+
 def build_directory(quarters=8):
     init_schema()
     best = {}
@@ -758,6 +837,17 @@ HTML = r"""<!DOCTYPE html>
   .b-HOLD{background:rgba(138,151,166,.14);color:var(--mut)}
   .pct{font-size:12px;font-weight:600;margin-top:3px}
   .up{color:var(--green)} .dn{color:var(--red)}
+  .scrollx{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line);border-radius:var(--r);background:var(--card)}
+  .htbl{width:100%;border-collapse:collapse;font-size:13px;min-width:560px}
+  .htbl th{font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);font-weight:600;text-align:right;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;background:var(--card)}
+  .htbl th.l{text-align:left}
+  .htbl td{padding:10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap;vertical-align:middle}
+  .htbl td.l{text-align:left}
+  .htbl tr{cursor:pointer}
+  .htbl tbody tr:hover{background:var(--bg2)}
+  .htbl tr:last-child td{border-bottom:none}
+  .cellnm{font-weight:600;font-size:13.5px}
+  .cellsub{font-size:11px;color:var(--mut);margin-top:1px}
   .filterbar{display:flex;gap:7px;overflow-x:auto;padding:4px 0 2px;margin:8px 0;-ms-overflow-style:none;scrollbar-width:none}
   .filterbar::-webkit-scrollbar{display:none}
   .back{display:inline-flex;align-items:center;gap:6px;color:var(--mut);font-size:14px;cursor:pointer;margin-bottom:10px}
@@ -925,7 +1015,30 @@ async function searchStocks(q){
         <span style="color:var(--acc);font-size:20px">›</span></div></div>`).join('');
   }catch(e){app.innerHTML=errBox(false,e.message);}
 }
+async function openFundInfo(cik,name){window.scrollTo(0,0);
+  app.innerHTML=`<span class="back" onclick="openFund('${cik}','${(name||'').replace(/'/g,'')}')">‹ back to holdings</span><div class="spin">Loading fund profile…</div>`;
+  try{const d=await api('/api/fundinfo/'+cik);
+    let h=`<span class="back" onclick="openFund('${cik}','${(name||'').replace(/'/g,'')}')">‹ back to holdings</span>
+      <div class="fhead"><div class="h1">${d.name}</div></div>`;
+    if(d.blurb)h+=`<div class="card"><div class="sec-title" style="margin:0 0 6px">Strategy</div><div style="font-size:14px;line-height:1.5">${d.blurb}</div></div>`;
+    if(d.people)h+=`<div class="card"><div class="sec-title" style="margin:0 0 6px">Key people</div><div style="font-size:14px;line-height:1.5">${d.people}</div></div>`;
+    h+=`<div class="card"><div class="sec-title" style="margin:0 0 6px">Filer facts (SEC)</div>
+      <div style="font-size:13.5px;line-height:1.8">
+      ${d.location?`📍 ${d.location}<br>`:''}
+      ${d.sic?`🏷️ ${d.sic}<br>`:''}
+      🗂️ ${d.filingsCount} 13F filings on record${d.firstPeriod?` (since ${d.firstPeriod})`:''}<br>
+      📅 Latest: ${d.latestPeriod||'—'}</div></div>`;
+    h+=`<div class="card"><div class="sec-title" style="margin:0 0 8px">Links</div>`;
+    if(d.website)h+=`<a href="https://${d.website}" target="_blank" class="chip on" style="display:inline-block;margin:0 6px 6px 0">🌐 ${d.website}</a>`;
+    h+=`<a href="${d.edgarUrl}" target="_blank" class="chip" style="display:inline-block;margin:0 6px 6px 0">📄 SEC EDGAR filings</a>
+        <a href="${d.searchUrl}" target="_blank" class="chip" style="display:inline-block;margin:0 6px 6px 0">🔎 Search the web</a></div>`;
+    if(!d.blurb)h+=`<div class="muted" style="font-size:12px;text-align:center;margin:8px 0">Strategy & people aren't in SEC filings — curated profiles exist for major funds; use the links above for the rest.</div>`;
+    h+=`<button class="alertbtn" onclick="openFund('${cik}','${(name||'').replace(/'/g,'')}')">‹ View holdings</button>`;
+    app.innerHTML=h;
+  }catch(e){app.innerHTML=errBox(false,e.message);}
+}
 async function openStock(cusip,name){window.scrollTo(0,0);
+  tab='stocks';document.querySelectorAll('.nav a').forEach(a=>a.classList.toggle('on',a.dataset.tab==='stocks'));
   app.innerHTML=`<span class="back" onclick="setTab('stocks')">‹ back</span><div class="spin">Loading holders…</div>`;
   try{const d=await api('/api/stock?cusip='+encodeURIComponent(cusip));
     const h=d.holders||[];
@@ -992,8 +1105,8 @@ function drawFund(demo){
   const period=(d.current&&d.current.reportDate)||'';
   let h=`<span class="back" onclick="setTab('search')">‹ back</span>`;
   if(demo||d.demo)h+=`<div class="banner">Sample data — run <b>python app.py</b> and search to pull live filings.</div>`;
-  h+=`<div class="fhead"><div class="h1">${d.name}</div>
-     <div class="muted" style="font-size:13px">13F-HR · period ending ${period} · filed ${(d.current&&d.current.filingDate)||''}</div></div>`;
+  h+=`<div class="fhead"><div class="h1" style="cursor:pointer" onclick="openFundInfo('${d.cik}','${(d.name||'').replace(/'/g,'')}')">${d.name} <span style="color:var(--acc);font-size:14px;vertical-align:middle">ⓘ</span></div>
+     <div class="muted" style="font-size:13px">13F-HR · period ending ${period} · filed ${(d.current&&d.current.filingDate)||''} · <span style="color:var(--acc);cursor:pointer" onclick="openFundInfo('${d.cik}','${(d.name||'').replace(/'/g,'')}')">about this fund</span></div></div>`;
   if(d.periods&&d.periods.length>1){
     h+=`<select onchange="openFund('${d.cik}','${(d.name||'').replace(/'/g,'')}',this.value)"
       style="width:100%;margin-bottom:12px;background:var(--bg2);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:12px;font-size:15px;font-weight:600">
@@ -1013,31 +1126,35 @@ function drawFund(demo){
   h+=`<div class="filterbar">`+fl.map(f=>{const n=f==='CURRENT'?active:(counts[f]||0);
      return `<span class="chip ${filter===f?'on':''}" onclick="setFilter('${f}')">${f} ${n}</span>`;}).join('')+`</div>`;
   h+=`<div id="enrichTag" class="muted" style="font-size:11.5px;margin:0 2px 8px"></div>`;
-  // rows — CURRENT shows what the fund holds now (matches Wisdom Whale); SOLD lives in its own tab
-  h+=`<div class="card" style="padding:4px 14px">`;
+  h+=`<div class="muted" style="font-size:11px;margin:0 2px 6px">Tap any holding to see which funds own it →</div>`;
+  // columnar table (Wisdom Whale style) — CURRENT shows current holdings; SOLD in its own tab
   const rows=d.holdings.filter(x=>filter==='CURRENT'?x.status!=='SOLD':x.status===filter);
-  if(!rows.length)h+=`<div class="empty" style="padding:30px">No ${filter.toLowerCase()} positions.</div>`;
-  rows.forEach(x=>{
-    let p='';
-    if(x.status==='SOLD')p=`<div class="pct dn">sold out</div>`;
-    else if(x.sharesChangePct===null)p=`<div class="pct up">new buy</div>`;
-    else if(x.sharesChangePct!==0)p=`<div class="pct ${x.sharesChangePct>0?'up':'dn'}">${pct(x.sharesChangePct)} shares</div>`;
-    // enrichment line: sector · % of company · 12-mo return
-    let meta=[];
-    if(x.sector)meta.push(x.sector);
-    if(x.pctOwnership)meta.push(`${(x.pctOwnership*100).toFixed(x.pctOwnership<0.01?2:1)}% of co`);
-    let perf='';
-    if(x.ret12m!=null)perf=`<span class="${x.ret12m>=0?'up':'dn'}">12-mo ${pct(x.ret12m)}</span>`;
-    const meta2=(meta.length||perf)?`<div class="sub" style="margin-top:3px">${meta.join(' · ')}${(meta.length&&perf)?' · ':''}${perf}</div>`:'';
-    h+=`<div class="hrow">
-      <div class="tkr">${x.ticker||tkr(x.name)}</div>
-      <div class="grow"><div class="nm">${x.name}${x.ticker?` <span style="color:var(--acc);font-weight:700">${x.ticker}</span>`:''}</div>
-        <div class="sub">${x.pctPortfolio?`<b style="color:var(--txt)">${(x.pctPortfolio*100).toFixed(1)}%</b> · `:''}${(x.shares||0).toLocaleString()} sh · ${x.class||''}${x.putCall?' · '+x.putCall:''}</div>
-        ${meta2}</div>
-      <div class="right"><div class="val">${fmt(x.value)}</div>
-        <span class="badge b-${x.status}">${x.status}</span>${p}</div>
-    </div>`;});
-  h+=`</div><div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0 4px">
+  if(!rows.length){h+=`<div class="card"><div class="empty" style="padding:30px">No ${filter.toLowerCase()} positions.</div></div>`;}
+  else{
+    h+=`<div class="scrollx"><table class="htbl"><thead><tr>
+      <th class="l">Stock</th><th>Mkt Value</th><th>% Port</th><th>% Owned</th><th>12-mo</th><th>Δ Shares</th>
+      </tr></thead><tbody>`;
+    rows.forEach(x=>{
+      let chg;
+      if(x.status==='SOLD')chg=`<span class="badge b-SOLD">SOLD</span>`;
+      else if(x.sharesChangePct===null)chg=`<span class="badge b-NEW">NEW</span>`;
+      else if(x.sharesChangePct===0)chg=`<span class="badge b-HOLD">—</span>`;
+      else chg=`<span class="${x.sharesChangePct>0?'up':'dn'}">${pct(x.sharesChangePct)}</span>`;
+      const ret=(x.ret12m!=null)?`<span class="${x.ret12m>=0?'up':'dn'}">${pct(x.ret12m)}</span>`:`<span class="muted">—</span>`;
+      const own=x.pctOwnership?`${(x.pctOwnership*100).toFixed(x.pctOwnership<0.01?2:1)}%`:`<span class="muted">—</span>`;
+      const por=x.pctPortfolio?`${(x.pctPortfolio*100).toFixed(1)}%`:`<span class="muted">—</span>`;
+      h+=`<tr onclick="openStock('${x.cusip}','${(x.name||'').replace(/'/g,'')}')">
+        <td class="l"><div class="cellnm">${x.ticker?`<span style="color:var(--acc)">${x.ticker}</span> · `:''}${x.name}</div>
+          <div class="cellsub">${x.sector?x.sector+' · ':''}${(x.shares||0).toLocaleString()} sh</div></td>
+        <td>${fmt(x.value)}</td>
+        <td>${por}</td>
+        <td>${own}</td>
+        <td>${ret}</td>
+        <td>${chg}</td>
+      </tr>`;});
+    h+=`</tbody></table></div>`;
+  }
+  h+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0 4px">
      13F holdings from SEC EDGAR. Sector & shares outstanding from SEC; 12-mo return from market prices (approx).</div>`;
   app.innerHTML=h;
 }
@@ -1198,6 +1315,13 @@ def _holdings(cik):
         return jsonify(build_fund_payload(cik, period))
     except Exception as e:
         return jsonify({"error": "Could not load from EDGAR: %s" % e, "cik": cik})
+
+@app.route("/api/fundinfo/<cik>")
+def _fundinfo(cik):
+    try:
+        return jsonify(fund_info(str(cik).zfill(10)))
+    except Exception as e:
+        return jsonify({"error": str(e), "cik": cik})
 
 @app.route("/api/enrich/<cik>")
 def _enrich(cik):
