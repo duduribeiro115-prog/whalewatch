@@ -11,6 +11,7 @@ Usage:
 Data (SQLite) is stored next to this file as whalewatch.db.
 """
 import os, re, sys, time, json, sqlite3, threading
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import xml.etree.ElementTree as ET
 from functools import lru_cache
@@ -32,11 +33,15 @@ SEC_UA = os.environ.get("SEC_UA", "WhaleWatch/1.0 (Eduardo Ribeiro eduardoribeir
 SEC_HEADERS = {"User-Agent": SEC_UA, "Accept-Encoding": "gzip, deflate"}
 
 _last = [0.0]
+_throttle_lock = threading.Lock()
 def _throttle():
-    d = time.time() - _last[0]
-    if d < 0.13:
-        time.sleep(0.13 - d)
-    _last[0] = time.time()
+    # Thread-safe: enforces global SEC spacing (~7.7 req/s, under SEC's 10/s cap)
+    # even when enrichment runs across a thread pool.
+    with _throttle_lock:
+        d = time.time() - _last[0]
+        if d < 0.13:
+            time.sleep(0.13 - d)
+        _last[0] = time.time()
 
 def sec_get(url, **kw):
     _throttle()
@@ -444,14 +449,16 @@ def enrich_security(cusip, name, max_price_age_days=7):
         shares_out, shares_date = _shares_outstanding(cik)
     if not shares_out and ticker in SHARES_OUT_OVERRIDE:   # foreign filers missing from SEC XBRL
         shares_out, shares_date = SHARES_OUT_OVERRIDE[ticker]
-    ret = _ret_12m(ticker) if ticker else None
+    # Additive-only: a failed live fetch must never blank a value we already had.
+    fetched_ret = _ret_12m(ticker) if ticker else None
+    ret = fetched_ret if fetched_ret is not None else (cached or {}).get("ret_12m")
 
     con = connect()
     con.execute("""INSERT OR REPLACE INTO securities
         (cusip,ticker,cik,sector,shares_out,shares_out_date,ret_12m,enriched_at,priced_at)
         VALUES (?,?,?,?,?,?,?,?,?)""",
         (cusip, ticker, cik, sector or "", shares_out, shares_date, ret,
-         _now(), _now() if ret is not None else (cached or {}).get("priced_at")))
+         _now(), _now() if fetched_ret is not None else (cached or {}).get("priced_at")))
     con.commit(); con.close()
     return _cached_security(cusip)
 
@@ -797,11 +804,16 @@ def enrich_fund(cik, period=None, cap=40):
     if payload.get("error"):
         return payload
     active = [h for h in payload["holdings"] if h["status"] != "SOLD"][:cap]
-    for h in active:
+    def _one(h):
         try:
             enrich_security(h["cusip"], h["name"])
         except Exception:
-            continue
+            pass
+    if active:
+        # Fetch holdings concurrently. SEC stays rate-limited by _throttle();
+        # the win is overlapping the slower Yahoo price calls + DB writes.
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(_one, active))
     return build_fund_payload(cik, period)  # rebuild with freshly cached values
 
 # Hand-written profiles for well-known managers. Matched by NAME (not CIK) so a
@@ -964,16 +976,37 @@ def enrich_held(limit=1200):
         WHERE f.holdings_status='ingested' AND h.cusip IS NOT NULL AND h.cusip!=''
         LIMIT ?""", (limit,)).fetchall()
     con.close()
-    done = 0
-    for i, r in enumerate(rows, 1):
+    done = {"n": 0}
+    lock = threading.Lock()
+    def _one(r):
         try:
             enrich_security(r["cusip"], r["name"])
-            done += 1
+            with lock:
+                done["n"] += 1
         except Exception:
             pass
-        if i % 100 == 0:
-            print("  ...enriched %d/%d securities" % (i, len(rows)))
-    return done
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(_one, rows))
+    return done["n"]
+
+_prewarm_started = [False]
+def start_prewarm():
+    """Warm the enrichment cache in the background on server start, so funds open
+    already filled instead of waiting on live SEC/Yahoo fetches at page-open time.
+    Render's disk is ephemeral (wiped on each deploy/restart), so this rebuilds the
+    cache once per boot; already-cached securities are skipped by enrich_security."""
+    if _prewarm_started[0]:
+        return
+    _prewarm_started[0] = True
+    def _bg():
+        try:
+            time.sleep(3)  # let gunicorn finish binding first
+            init_schema()
+            n = enrich_held()
+            print("[prewarm] cached enrichment for %d securities" % n)
+        except Exception as e:
+            sys.stderr.write("[prewarm] failed: %s\n" % e)
+    threading.Thread(target=_bg, name="prewarm", daemon=True).start()
 
 def refresh():
     init_schema()
@@ -1745,7 +1778,13 @@ def main():
     else:
         print("  Directory: %d funds (%d with holdings)." % (total, ing))
     print("  WhaleWatch -> http://localhost:8000   (Ctrl+C to stop)\n")
+    start_prewarm()
     app.run(host="0.0.0.0", port=8000, debug=False)
+
+# Under gunicorn/WSGI the module is imported (not __main__), and CLI commands like
+# `refresh`/`build` run via main() below — so warm the cache only on the serving path.
+if __name__ != "__main__":
+    start_prewarm()
 
 if __name__ == "__main__":
     main()
