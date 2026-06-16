@@ -761,13 +761,20 @@ def build_fund_payload(cik, period=None):
         curr = cat[0]
     idx = cat.index(curr)
     prev = cat[idx + 1] if idx + 1 < len(cat) else None
-    # make sure the holdings for current (and prior, for the diff) are loaded
-    ensure_ingested(cik, curr["accession"], curr["form"], curr["filing_date"], curr["report_date"])
+    # make sure the holdings for current (and prior, for the diff) are loaded.
+    # Each is an independent EDGAR download; fetch them concurrently so first-open
+    # latency is ~one filing instead of two back-to-back.
     if prev:
-        try:
-            ensure_ingested(cik, prev["accession"], prev["form"], prev["filing_date"], prev["report_date"])
-        except Exception:
-            prev = None
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fc = ex.submit(ensure_ingested, cik, curr["accession"], curr["form"], curr["filing_date"], curr["report_date"])
+            fp = ex.submit(ensure_ingested, cik, prev["accession"], prev["form"], prev["filing_date"], prev["report_date"])
+            fc.result()                      # current-quarter errors propagate as before
+            try:
+                fp.result()
+            except Exception:
+                prev = None                  # prior is best-effort (only needed for the diff)
+    else:
+        ensure_ingested(cik, curr["accession"], curr["form"], curr["filing_date"], curr["report_date"])
     curr_rows = _snap_agg(aggregate(get_holdings(curr["accession"])))
     if prev:
         holdings = diff(curr_rows, _snap_agg(aggregate(get_holdings(prev["accession"]))))
