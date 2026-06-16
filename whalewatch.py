@@ -804,21 +804,21 @@ def _dedupe_periods(cat):
 
 def fund_value_history(cik, max_quarters=40):
     """Total reported 13F holdings value for each of a fund's quarters, oldest→newest.
-    Ingests any missing filings from EDGAR once (then cached in the DB); SEC calls are
-    globally rate-limited in sec_get, so the workers just parse in parallel. This is
-    the sum of long US-listed positions a 13F discloses — NOT the manager's total AUM."""
+    For each quarter we use the MOST COMPLETE filing: a quarter can have a 13F-HR plus
+    later 13F-HR/A amendments that only restate a few positions (and 13F-NT notices with
+    none), so picking the newest accession would understate it — we take the filing with
+    the largest total. Missing filings are ingested from EDGAR once (cached; SEC calls are
+    globally rate-limited). Long US-listed 13F positions only — NOT the manager's AUM."""
     cik = str(cik).zfill(10)
     cat = ensure_catalog(cik)
-    # one filing per quarter (catalog is newest-first; keep the newest accession),
-    # then cap to the most recent N quarters to bound first-load cost.
-    seen, picks = set(), []
+    by_q = {}
     for f in cat:
         rd = f["report_date"]
-        if not rd or rd in seen:
-            continue
-        seen.add(rd); picks.append(f)
-    picks = picks[:max_quarters]
-    missing = [f for f in picks if not has_filing(f["accession"])]
+        if rd:
+            by_q.setdefault(rd, []).append(f)
+    quarters = sorted(by_q.keys(), reverse=True)[:max_quarters]   # most-recent N quarters
+    cand = [f for rd in quarters for f in by_q[rd]]               # every filing in those quarters
+    missing = [f for f in cand if not has_filing(f["accession"])]
     if missing:
         def _ing(f):
             try:
@@ -828,14 +828,18 @@ def fund_value_history(cik, max_quarters=40):
         with ThreadPoolExecutor(max_workers=4) as ex:
             list(ex.map(_ing, missing))
     out = []
-    for f in picks:
-        rows = get_holdings(f["accession"])
-        if not rows:
-            continue
-        agg = _snap_agg(aggregate(rows))             # same value-unit correction as the holdings view
-        total = sum((h.get("value") or 0.0) for h in agg.values())
-        if total:
-            out.append({"period": f["report_date"], "value": total})
+    for rd in quarters:
+        best = 0.0
+        for f in by_q[rd]:
+            rows = get_holdings(f["accession"])
+            if not rows:
+                continue
+            agg = _snap_agg(aggregate(rows))         # same value-unit correction as the holdings view
+            tot = sum((h.get("value") or 0.0) for h in agg.values())
+            if tot > best:
+                best = tot
+        if best > 0:
+            out.append({"period": rd, "value": best})
     out.sort(key=lambda r: r["period"])              # oldest → newest for the chart
     return out
 
