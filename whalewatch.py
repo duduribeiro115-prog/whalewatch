@@ -746,38 +746,79 @@ def ingest_fund(cik, max_filings=2, force=False):
         new += 1
     return new
 
+def _quarters(cat):
+    """Group a catalog into quarters, newest-first. Returns (order, by_q): order is the
+    distinct report_dates newest→oldest; by_q maps each to its filings (a quarter can have
+    an original 13F-HR plus later 13F-HR/A amendments and 13F-NT notices)."""
+    order, by_q = [], {}
+    for f in cat:                                  # cat is newest-first
+        rd = f.get("report_date")
+        if not rd:
+            continue
+        if rd not in by_q:
+            by_q[rd] = []; order.append(rd)
+        by_q[rd].append(f)
+    return order, by_q
+
+def _best_filing(cik, filings):
+    """The most COMPLETE filing for one quarter, plus its total holdings value.
+    A quarter's real holdings are whichever filing sums to the most — a partial
+    13F-HR/A amendment (a few restated positions) or empty 13F-NT must not win over
+    the full 13F-HR. Ingests any not-yet-cached filings, then returns (filing, total)."""
+    for f in filings:
+        if not has_filing(f["accession"]):
+            try:
+                ensure_ingested(cik, f["accession"], f["form"], f["filing_date"], f["report_date"])
+            except Exception:
+                pass
+    best, best_tot = None, -1.0
+    for f in filings:
+        rows = get_holdings(f["accession"])
+        tot = sum((h.get("value") or 0.0) for h in _snap_agg(aggregate(rows)).values()) if rows else 0.0
+        if tot > best_tot:
+            best_tot, best = tot, f
+    return (best or filings[0], max(best_tot, 0.0))
+
 def build_fund_payload(cik, period=None):
-    """Holdings + QoQ for one quarter. period = a reportDate or accession; default = latest."""
+    """Holdings + QoQ for one quarter. period = a reportDate or accession; default = latest.
+    Uses the most COMPLETE filing per quarter (so a partial 13F-HR/A amendment can't replace
+    the full 13F-HR), and diffs against the prior DISTINCT quarter."""
     cik = str(cik).zfill(10)
     fund = get_fund(cik) or {"name": cik, "cik": cik}
     cat = ensure_catalog(cik)
     if not cat:
         return {"error": "No 13F-HR filings found", "name": fund["name"], "cik": cik}
-    # pick the selected quarter (default newest)
-    curr = None
+    order, by_q = _quarters(cat)
+    # resolve the selected quarter (period may be a report_date or a specific accession)
+    sel = None
     if period:
-        curr = next((f for f in cat if f["report_date"] == period or f["accession"] == period), None)
-    if curr is None:
-        curr = cat[0]
-    idx = cat.index(curr)
-    prev = cat[idx + 1] if idx + 1 < len(cat) else None
-    # make sure the holdings for current (and prior, for the diff) are loaded.
-    # Each is an independent EDGAR download; fetch them concurrently so first-open
-    # latency is ~one filing instead of two back-to-back.
-    if prev:
+        if period in by_q:
+            sel = period
+        else:
+            for rd, fs in by_q.items():
+                if any(f["accession"] == period for f in fs):
+                    sel = rd; break
+    if sel is None:
+        sel = order[0]
+    sidx = order.index(sel)
+    prev_rd = order[sidx + 1] if sidx + 1 < len(order) else None
+    # resolve the most-complete filing for the current (and prior) quarter. Each may need an
+    # EDGAR download, so do the two quarters concurrently to keep first-open latency low.
+    if prev_rd:
         with ThreadPoolExecutor(max_workers=2) as ex:
-            fc = ex.submit(ensure_ingested, cik, curr["accession"], curr["form"], curr["filing_date"], curr["report_date"])
-            fp = ex.submit(ensure_ingested, cik, prev["accession"], prev["form"], prev["filing_date"], prev["report_date"])
-            fc.result()                      # current-quarter errors propagate as before
+            fc = ex.submit(_best_filing, cik, by_q[sel])
+            fp = ex.submit(_best_filing, cik, by_q[prev_rd])
+            curr, _ = fc.result()            # current-quarter errors propagate as before
             try:
-                fp.result()
+                prev, _ = fp.result()
             except Exception:
                 prev = None                  # prior is best-effort (only needed for the diff)
     else:
-        ensure_ingested(cik, curr["accession"], curr["form"], curr["filing_date"], curr["report_date"])
+        curr, _ = _best_filing(cik, by_q[sel]); prev = None
     curr_rows = _snap_agg(aggregate(get_holdings(curr["accession"])))
-    if prev:
-        holdings = diff(curr_rows, _snap_agg(aggregate(get_holdings(prev["accession"]))))
+    prev_rows = _snap_agg(aggregate(get_holdings(prev["accession"]))) if prev else None
+    if prev_rows:
+        holdings = diff(curr_rows, prev_rows)
     else:
         holdings = sorted([{**c, "status": "NEW", "sharesChangePct": None} for c in curr_rows.values()],
                           key=lambda r: r["value"], reverse=True)
@@ -791,7 +832,7 @@ def build_fund_payload(cik, period=None):
             "previous": ({"reportDate": prev["report_date"]} if prev else None),
             "totalValue": total, "positions": len(active), "holdings": holdings,
             "periods": _dedupe_periods(cat),
-            "selectedPeriod": curr["report_date"]}
+            "selectedPeriod": sel}
 
 def _dedupe_periods(cat):
     seen, out = set(), []
@@ -810,15 +851,10 @@ def fund_value_history(cik, max_quarters=40):
     the largest total. Missing filings are ingested from EDGAR once (cached; SEC calls are
     globally rate-limited). Long US-listed 13F positions only — NOT the manager's AUM."""
     cik = str(cik).zfill(10)
-    cat = ensure_catalog(cik)
-    by_q = {}
-    for f in cat:
-        rd = f["report_date"]
-        if rd:
-            by_q.setdefault(rd, []).append(f)
-    quarters = sorted(by_q.keys(), reverse=True)[:max_quarters]   # most-recent N quarters
-    cand = [f for rd in quarters for f in by_q[rd]]               # every filing in those quarters
-    missing = [f for f in cand if not has_filing(f["accession"])]
+    order, by_q = _quarters(ensure_catalog(cik))
+    quarters = order[:max_quarters]                  # most-recent N quarters
+    # pre-ingest everything in those quarters in parallel; _best_filing then reads from cache.
+    missing = [f for rd in quarters for f in by_q[rd] if not has_filing(f["accession"])]
     if missing:
         def _ing(f):
             try:
@@ -829,17 +865,9 @@ def fund_value_history(cik, max_quarters=40):
             list(ex.map(_ing, missing))
     out = []
     for rd in quarters:
-        best = 0.0
-        for f in by_q[rd]:
-            rows = get_holdings(f["accession"])
-            if not rows:
-                continue
-            agg = _snap_agg(aggregate(rows))         # same value-unit correction as the holdings view
-            tot = sum((h.get("value") or 0.0) for h in agg.values())
-            if tot > best:
-                best = tot
-        if best > 0:
-            out.append({"period": rd, "value": best})
+        _, tot = _best_filing(cik, by_q[rd])
+        if tot > 0:
+            out.append({"period": rd, "value": tot})
     out.sort(key=lambda r: r["period"])              # oldest → newest for the chart
     return out
 
