@@ -802,6 +802,43 @@ def _dedupe_periods(cat):
         out.append({"reportDate": f["report_date"], "accession": f["accession"]})
     return out
 
+def fund_value_history(cik, max_quarters=40):
+    """Total reported 13F holdings value for each of a fund's quarters, oldest→newest.
+    Ingests any missing filings from EDGAR once (then cached in the DB); SEC calls are
+    globally rate-limited in sec_get, so the workers just parse in parallel. This is
+    the sum of long US-listed positions a 13F discloses — NOT the manager's total AUM."""
+    cik = str(cik).zfill(10)
+    cat = ensure_catalog(cik)
+    # one filing per quarter (catalog is newest-first; keep the newest accession),
+    # then cap to the most recent N quarters to bound first-load cost.
+    seen, picks = set(), []
+    for f in cat:
+        rd = f["report_date"]
+        if not rd or rd in seen:
+            continue
+        seen.add(rd); picks.append(f)
+    picks = picks[:max_quarters]
+    missing = [f for f in picks if not has_filing(f["accession"])]
+    if missing:
+        def _ing(f):
+            try:
+                ensure_ingested(cik, f["accession"], f["form"], f["filing_date"], f["report_date"])
+            except Exception:
+                pass
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(_ing, missing))
+    out = []
+    for f in picks:
+        rows = get_holdings(f["accession"])
+        if not rows:
+            continue
+        agg = _snap_agg(aggregate(rows))             # same value-unit correction as the holdings view
+        total = sum((h.get("value") or 0.0) for h in agg.values())
+        if total:
+            out.append({"period": f["report_date"], "value": total})
+    out.sort(key=lambda r: r["period"])              # oldest → newest for the chart
+    return out
+
 def _attach_cached_enrichment(h):
     """Add ticker/sector/sharesOutstanding/pctOwnership/ret12m from cache (if any)."""
     cu = (h.get("cusip") or "").upper()
@@ -1373,6 +1410,32 @@ async function enrichFund(cik,period){
   enriching=false;
 }
 function qlabel(d){if(!d)return d;const p=String(d).split('-');const q={'03':'Q1','06':'Q2','09':'Q3','12':'Q4'}[p[1]]||p[1];return q+' '+p[0];}
+// --- Holdings-value-over-time chart (dependency-free SVG) ---
+let histCache={};
+async function loadHistory(cik){
+  if(histCache[cik]!==undefined){if(curFund&&curFund.cik===cik)drawFund(curFund.demo);return;}
+  try{const d=await api('/api/history/'+cik);histCache[cik]=(d&&d.series)||[];}
+  catch(e){histCache[cik]=[];}
+  if(curFund&&curFund.cik===cik)drawFund(curFund.demo);
+}
+function niceNum(x,round){if(!isFinite(x)||x<=0)return 1;const e=Math.floor(Math.log10(x)),f=x/Math.pow(10,e);let nf;if(round){nf=f<1.5?1:f<3?2:f<7?5:10;}else{nf=f<=1?1:f<=2?2:f<=5?5:10;}return nf*Math.pow(10,e);}
+function histChartSVG(series){
+  const n=series.length;if(!n)return'';
+  const bw=22,gap=12,padL=58,padR=14,padT=10,padB=54,plotH=190;
+  const W=padL+padR+n*bw+(n>1?(n-1)*gap:0),H=padT+plotH+padB;
+  const max=Math.max.apply(null,series.map(d=>d.value));
+  const step=niceNum(niceNum(max,false)/4,true),nm=Math.max(step,Math.ceil(max/step)*step),ticks=Math.round(nm/step);
+  const y=v=>padT+plotH-(v/nm)*plotH;
+  let g='';
+  for(let i=0;i<=ticks;i++){const v=nm*i/ticks,yy=y(v);
+    g+=`<line x1="${padL}" y1="${yy}" x2="${W-padR}" y2="${yy}" style="stroke:var(--line)" stroke-width="1"/>`;
+    g+=`<text x="${padL-8}" y="${yy+4}" text-anchor="end" font-size="11" style="fill:var(--mut)">${fmt(v)}</text>`;}
+  series.forEach((d,i)=>{const x=padL+i*(bw+gap),bh=Math.max(1,(d.value/nm)*plotH),yy=padT+plotH-bh;
+    g+=`<g><title>${qlabel(d.period)} — ${fmt(d.value)}</title><rect x="${x}" y="${yy}" width="${bw}" height="${bh}" rx="2" style="fill:var(--acc);fill-opacity:.5;stroke:var(--acc);stroke-width:1"/></g>`;
+    if(i%2===0||n<=14){const cx=x+bw/2,ty=padT+plotH+14;
+      g+=`<text x="${cx}" y="${ty}" text-anchor="end" font-size="10.5" style="fill:var(--mut)" transform="rotate(-45 ${cx} ${ty})">${qlabel(d.period)}</text>`;}});
+  return `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" style="display:block" xmlns="http://www.w3.org/2000/svg">${g}</svg>`;
+}
 async function loadDemo(){window.scrollTo(0,0);
   app.innerHTML=`<div class="spin">Loading sample…</div>`;
   try{renderFund(await api('/api/demo'),true);}catch(e){app.innerHTML=`<div class="empty">Sample unavailable.</div>`;}
@@ -1401,8 +1464,12 @@ function drawFund(demo){
   h+=`<div class="stats">
      <div class="stat"><div class="k">Portfolio value</div><div class="v">${fmt(d.totalValue)}</div></div>
      <div class="stat"><div class="k">Positions</div><div class="v">${d.positions}</div></div>
-   </div>
-   <button class="alertbtn ${al?'on':''}" onclick="toggleAlert('${d.cik}','${(d.name||'').replace(/'/g,'')}')">
+   </div>`;
+  if(!demo&&!d.demo){const hs=histCache[d.cik];
+    h+=`<div style="margin-bottom:12px"><div class="sec-title" style="margin:0 0 8px">Holdings value (13F) over time</div>`+
+       `<div class="scrollx" style="padding:10px 12px">${hs?(hs.length?histChartSVG(hs):`<div class="muted" style="font-size:12px;padding:18px 0;text-align:center">No filing history available.</div>`):`<div class="muted" style="font-size:12px;padding:26px 0;text-align:center">Loading history from EDGAR…</div>`}</div>`+
+       `<div class="muted" style="font-size:10.5px;text-align:center;margin:6px 2px 0">Total reported 13F holdings each quarter — long US-listed positions only, not total AUM.</div></div>`;}
+  h+=`<button class="alertbtn ${al?'on':''}" onclick="toggleAlert('${d.cik}','${(d.name||'').replace(/'/g,'')}')">
      ${al?'🔔 Alerts on — you’ll be notified on new filings':'🔔 Alert me when this fund files'}</button>
    <button class="alertbtn ${on?'on':''}" style="margin-top:8px" onclick="star('${d.cik}','${(d.name||'').replace(/'/g,'')}');drawFund(${demo?true:false})">
      ${on?'★ In your watchlist':'☆ Add to watchlist'}</button>`;
@@ -1443,6 +1510,7 @@ function drawFund(demo){
   h+=`<div class="muted" style="font-size:11.5px;text-align:center;margin:14px 0 4px">
      Mkt Value in USD ($K/$M/$B); share counts under each name are exact. 13F from SEC EDGAR; sector & shares outstanding from SEC; 12-mo return from market prices (approx).</div>`;
   app.innerHTML=h;
+  if(!demo&&!d.demo&&histCache[d.cik]===undefined)loadHistory(d.cik);
 }
 function setFilter(f){filter=f;drawFund(curFund.demo);}
 
@@ -1621,6 +1689,14 @@ def _enrich(cik):
         return jsonify(enrich_fund(str(cik).zfill(10), period))
     except Exception as e:
         return jsonify({"error": str(e), "cik": cik})
+
+@app.route("/api/history/<cik>")
+def _history(cik):
+    """Per-quarter total 13F holdings value, for the fund AUM-style chart."""
+    try:
+        return jsonify({"cik": str(cik).zfill(10), "series": fund_value_history(str(cik).zfill(10))})
+    except Exception as e:
+        return jsonify({"error": str(e), "cik": cik, "series": []})
 
 @app.route("/api/stock")
 def _stock():
