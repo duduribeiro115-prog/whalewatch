@@ -303,7 +303,17 @@ CUSIP_TICKER = {
 # that do NOT report the dei:EntityCommonStockSharesOutstanding cover-page tag,
 # so % owned can still be computed. (shares, as_of_date). Update occasionally.
 SHARES_OUT_OVERRIDE = {
-    "BN": (2450808038.0, "2026-05-15"),   # Brookfield Corp Class A (40-F; absent from SEC XBRL)
+    # Curated total shares outstanding (all classes) for issuers SEC's per-concept
+    # XBRL API can't serve: foreign 40-F filers, and multi-class US filers that report
+    # shares only with per-class dimensions (so companyconcept returns NoSuchKey).
+    # Values are point-in-time from each issuer's latest 10-Q/10-K/40-F cover page and
+    # drift slowly with buybacks/issuance — refresh occasionally.
+    "BN":    (2450808038.0, "2026-05-15"),  # Brookfield Corp Class A (40-F; absent from SEC XBRL)
+    "META":  (2538423304.0, "2026-04-24"),  # Class A 2,196,045,588 + Class B 342,377,716
+    "NYT":   (161862699.0,  "2026-05-01"),  # Class A 161,081,975 + Class B 780,724
+    "LEN":   (246290000.0,  "2026-04-22"),  # Class A 215.24M + Class B 31.05M
+    "STZ":   (172198467.0,  "2026-04-17"),  # Class A 172,172,544 + Class 1 25,923
+    "LLYVA": (92003750.0,   "2026-03-31"),  # Liberty Live Series A 25,573,685 + B 2,530,951 + C 63,899,114
 }
 
 _TMAPS = None
