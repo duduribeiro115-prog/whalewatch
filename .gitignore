@@ -1,0 +1,7 @@
+# User / community data — must NEVER be committed to this public repo.
+social.db
+social.db-wal
+social.db-shm
+
+__pycache__/
+*.pyc

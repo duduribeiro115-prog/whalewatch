@@ -10,7 +10,7 @@ Usage:
 
 Data (SQLite) is stored next to this file as whalewatch.db.
 """
-import os, re, sys, time, json, sqlite3, threading
+import os, re, sys, time, json, sqlite3, threading, csv, io, secrets
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import xml.etree.ElementTree as ET
@@ -18,7 +18,8 @@ from functools import lru_cache
 
 try:
     import requests
-    from flask import Flask, jsonify, request, Response
+    from flask import Flask, jsonify, request, Response, session
+    from werkzeug.security import generate_password_hash, check_password_hash
 except ImportError:
     sys.stderr.write("\nMissing packages. Run this first:\n"
                      "    python3 -m pip install flask requests\n\n")
@@ -1207,6 +1208,7 @@ HTML = r"""<!DOCTYPE html>
   <a data-tab="search" class="on"><span class="ic">🔍</span>Funds</a>
   <a data-tab="stocks"><span class="ic">📈</span>Stocks</a>
   <a data-tab="watch"><span class="ic">⭐</span>Watchlist</a>
+  <a data-tab="community"><span class="ic">👥</span>Community</a>
   <a data-tab="alerts"><span class="ic">🔔</span>Alerts</a>
 </div>
 
@@ -1287,6 +1289,7 @@ function setTab(t){tab=t;document.querySelectorAll('.nav a').forEach(a=>a.classL
   if(t==='search')renderHome();
   if(t==='stocks')renderStocksHome();
   if(t==='watch')renderWatch();
+  if(t==='community')renderCommunity();
   if(t==='alerts')renderAlerts();}
 
 function renderHome(){
@@ -1590,6 +1593,115 @@ function errBoxTab(tab,msg){return `<div class="empty"><div class="big">⚠️</
   <div style="font-size:13px;max-width:340px;margin:0 auto">${msg}</div>
   <div style="margin-top:14px"><span class="chip on" onclick="runHealth()">Run a diagnostic</span></div></div>`;}
 
+// ===== Community (shared portfolios) =====
+let cuser=null, curPortfolio=null;
+async function capi(path,method,body){
+  const opt={method:method||'GET',headers:{'Content-Type':'application/json'}};
+  if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(path,opt); let b; try{b=await r.json();}catch(_){b=null;}
+  if(!r.ok)throw new Error((b&&b.error)||('HTTP '+r.status));
+  return b;
+}
+const inp='width:100%;margin-bottom:8px;padding:11px;border-radius:10px;border:1px solid var(--line);background:var(--bg2);color:var(--txt)';
+function renderCommunity(){window.scrollTo(0,0);app.innerHTML=`<div class="spin">Loading…</div>`;
+  capi('/api/community/me').then(d=>{cuser=d.user;if(cuser)renderMyDash(d.portfolio);else renderAuth('login');})
+   .catch(e=>{app.innerHTML=errBox(false,e.message);});}
+function renderAuth(mode){
+  app.innerHTML=`<div class="sec-title">Community portfolios</div>
+   <div class="card" style="padding:16px">
+     <div style="font-weight:700;font-size:16px;margin-bottom:4px">${mode==='login'?'Sign in':'Create account'}</div>
+     <div class="muted" style="font-size:12.5px;margin-bottom:12px">Share your portfolio and explore what others hold. For information only — not investment advice.</div>
+     <input id="c_user" placeholder="username" autocomplete="off" style="${inp}">
+     ${mode==='register'?`<input id="c_name" placeholder="display name (optional)" style="${inp}">`:''}
+     <input id="c_pw" type="password" placeholder="password" style="${inp}">
+     <button class="alertbtn on" onclick="doAuth('${mode}')">${mode==='login'?'Sign in':'Create account'}</button>
+     <div id="c_err" style="color:var(--red);font-size:12.5px;margin-top:8px"></div>
+     <div class="muted" style="font-size:12.5px;margin-top:10px">${mode==='login'?`No account? <a style="color:var(--acc);cursor:pointer" onclick="renderAuth('register')">Create one</a>`:`Have an account? <a style="color:var(--acc);cursor:pointer" onclick="renderAuth('login')">Sign in</a>`}</div>
+   </div>
+   <div style="margin-top:14px"><span class="chip" onclick="renderFeed()">Browse shared portfolios →</span></div>`;}
+async function doAuth(mode){
+  const u=$('#c_user').value, pw=$('#c_pw').value, nm=(mode==='register'&&$('#c_name'))?$('#c_name').value:'';
+  try{const d=await capi(mode==='login'?'/api/community/login':'/api/community/register','POST',{username:u,password:pw,display_name:nm});
+    cuser=d.user;renderCommunity();
+  }catch(e){const el=$('#c_err');if(el)el.textContent=e.message;}}
+async function doLogout(){try{await capi('/api/community/logout','POST');}catch(e){}cuser=null;renderAuth('login');}
+function renderMyDash(pf){
+  let h=`<div class="sec-title">My portfolio <span style="float:right;font-weight:500;font-size:12px"><a style="color:var(--acc);cursor:pointer" onclick="renderFeed()">Community feed →</a> &nbsp; <a style="color:var(--mut);cursor:pointer" onclick="doLogout()">sign out</a></span></div>`;
+  h+=`<div class="card" style="padding:14px">
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px">
+      <div class="tkr">${tkr(cuser.display_name||cuser.username)}</div>
+      <div class="grow"><div class="nm">${cuser.display_name||cuser.username}</div><div class="sub">@${cuser.username}</div></div>
+      <div style="text-align:right"><div class="nm">${fmt(pf.totalValue)}</div><div class="sub">${pf.ret12mBlended!=null?`<span class="${pf.ret12mBlended>=0?'up':'dn'}">${pct(pf.ret12mBlended)} 12-mo</span>`:'—'}</div></div></div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:10px 0 8px"><input type="checkbox" id="pf_public" ${pf.isPublic?'checked':''} onchange="savePf()"> Public — show on the community feed</label>
+    <textarea id="pf_strategy" placeholder="Describe your strategy (optional)" onblur="savePf()" style="width:100%;height:52px;padding:9px;border-radius:10px;border:1px solid var(--line);background:var(--bg2);color:var(--txt);font-size:13px">${pf.strategy||''}</textarea>
+    <div style="display:flex;gap:8px;margin-top:8px;align-items:center"><span class="sub">Cash $</span>
+      <input id="pf_cash" type="number" value="${pf.cash||0}" onblur="savePf()" style="width:130px;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--txt)"></div></div>`;
+  h+=`<div class="sec-title">Holdings (${pf.positions})</div>`;
+  if(pf.holdings.length){
+    h+=`<div class="scrollx"><table class="htbl"><thead><tr><th class="l">Ticker</th><th>Shares</th><th>Value</th><th>% Port</th><th>12-mo</th><th></th></tr></thead><tbody>`;
+    pf.holdings.forEach(x=>{h+=`<tr><td class="l"><span style="color:var(--acc)">${x.ticker}</span></td>
+      <td>${(x.shares||0).toLocaleString('en-US')}</td>
+      <td>${x.value!=null?fmt(x.value):'<span class="muted">—</span>'}</td>
+      <td>${x.weight!=null?(x.weight*100).toFixed(1)+'%':'<span class="muted">—</span>'}</td>
+      <td>${x.ret12m!=null?`<span class="${x.ret12m>=0?'up':'dn'}">${pct(x.ret12m)}</span>`:'<span class="muted">—</span>'}</td>
+      <td><span style="color:var(--red);cursor:pointer" onclick="delPos(${x.id})">✕</span></td></tr>`;});
+    h+=`</tbody></table></div>`;
+  }else{h+=`<div class="card"><div class="empty" style="padding:20px">No holdings yet. Add one below or import a CSV.</div></div>`;}
+  h+=`<div class="sec-title">Add a holding</div>
+   <div class="card" style="padding:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+     <input id="ap_t" placeholder="Ticker" style="width:92px;padding:9px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--txt);text-transform:uppercase">
+     <input id="ap_s" type="number" placeholder="Shares" style="width:104px;padding:9px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--txt)">
+     <input id="ap_c" type="number" placeholder="Cost (opt)" style="width:104px;padding:9px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--txt)">
+     <button class="chip on" onclick="addPos()">Add</button><span id="ap_err" style="color:var(--red);font-size:12px"></span></div>`;
+  h+=`<div class="sec-title">Import from broker (CSV)</div>
+   <div class="card" style="padding:12px">
+     <div class="muted" style="font-size:12px;margin-bottom:8px">Paste a CSV export. Needs a <b>symbol</b>/<b>ticker</b> column and a <b>shares</b>/<b>quantity</b> column (cost optional).</div>
+     <textarea id="csv_in" placeholder="Symbol,Quantity,Cost&#10;AAPL,10,150&#10;MSFT,5,300" style="width:100%;height:78px;padding:9px;border-radius:10px;border:1px solid var(--line);background:var(--bg2);color:var(--txt);font-size:12px;font-family:monospace"></textarea>
+     <button class="chip" style="margin-top:8px" onclick="importCsv()">Import</button><span id="csv_msg" style="font-size:12px;margin-left:8px"></span></div>`;
+  app.innerHTML=h;}
+async function savePf(){try{await capi('/api/community/portfolio','POST',{
+  isPublic:$('#pf_public')&&$('#pf_public').checked,
+  strategy:$('#pf_strategy')?$('#pf_strategy').value:'',
+  cash:$('#pf_cash')?$('#pf_cash').value:0});}catch(e){}}
+async function addPos(){try{await capi('/api/community/position','POST',{ticker:$('#ap_t').value,shares:$('#ap_s').value,costBasis:$('#ap_c').value});renderCommunity();}
+  catch(e){const el=$('#ap_err');if(el)el.textContent=e.message;}}
+async function delPos(id){try{await capi('/api/community/position/'+id,'DELETE');renderCommunity();}catch(e){}}
+async function importCsv(){try{const d=await capi('/api/community/import_csv','POST',{csv:$('#csv_in').value});
+  $('#csv_msg').innerHTML=`<span style="color:var(--green)">Imported ${d.added} holdings</span>`;setTimeout(renderCommunity,700);}
+  catch(e){$('#csv_msg').innerHTML=`<span style="color:var(--red)">${e.message}</span>`;}}
+function renderFeed(){window.scrollTo(0,0);app.innerHTML=`<div class="spin">Loading shared portfolios…</div>`;
+  capi('/api/community/feed').then(d=>{
+    let h=`<div class="sec-title">Shared portfolios <span style="float:right;font-weight:500;font-size:12px"><a style="color:var(--acc);cursor:pointer" onclick="renderCommunity()">${cuser?'← my portfolio':'sign in'}</a></span></div>`;
+    if(!d.portfolios.length){h+=`<div class="card"><div class="empty" style="padding:24px">No public portfolios yet.${cuser?' Make yours public to be first!':''}</div></div>`;}
+    d.portfolios.forEach(p=>{h+=`<div class="card"><div class="row" onclick="openPortfolio(${p.id})">
+      <div class="tkr">${tkr(p.owner)}</div>
+      <div class="grow"><div class="nm">${p.owner} ${p.top?`· <span style="color:var(--mut);font-weight:500">top ${p.top.ticker}</span>`:''}</div>
+        <div class="sub">${p.positions} holdings · ${fmt(p.totalValue)}${p.strategy?' · '+p.strategy.slice(0,46):''}</div></div>
+      <div style="text-align:right">${p.ret12mBlended!=null?`<div class="${p.ret12mBlended>=0?'up':'dn'}" style="font-weight:700">${pct(p.ret12mBlended)}</div><div class="sub">12-mo</div>`:''}</div></div></div>`;});
+    app.innerHTML=h;
+  }).catch(e=>{app.innerHTML=errBox(false,e.message);});}
+function openPortfolio(id){window.scrollTo(0,0);app.innerHTML=`<div class="spin">Loading portfolio…</div>`;
+  capi('/api/community/portfolio/'+id).then(p=>{curPortfolio=p;drawPortfolio();}).catch(e=>{app.innerHTML=errBox(false,e.message);});}
+function drawPortfolio(){const p=curPortfolio;
+  let h=`<span class="back" onclick="renderFeed()">‹ back to feed</span>`;
+  h+=`<div class="fhead"><div class="h1">${p.owner}</div>
+    <div class="muted" style="font-size:13px">${p.positions} holdings · ${fmt(p.totalValue)} ${p.ret12mBlended!=null?`· <span class="${p.ret12mBlended>=0?'up':'dn'}">${pct(p.ret12mBlended)} blended 12-mo</span>`:''}</div></div>`;
+  if(p.strategy)h+=`<div class="card" style="padding:12px"><div class="sub" style="font-style:italic">"${p.strategy}"</div></div>`;
+  h+=`<div class="card" style="padding:12px;margin-top:8px">
+     <div style="font-weight:700;margin-bottom:4px">📋 Replicate this portfolio</div>
+     <div class="muted" style="font-size:12px;margin-bottom:8px">Enter what you'd invest to see the matching allocation. You place any trades yourself in your own broker — this is not a recommendation or investment advice.</div>
+     <div style="display:flex;gap:8px;align-items:center">$ <input id="rep_amt" type="number" placeholder="10000" oninput="fillReplicate()" style="width:150px;padding:9px;border-radius:8px;border:1px solid var(--line);background:var(--bg2);color:var(--txt)"></div></div>`;
+  h+=`<div class="sec-title">Holdings</div>
+    <div class="scrollx"><table class="htbl"><thead><tr><th class="l">Ticker</th><th>% Port</th><th>12-mo</th><th id="rep_h"></th></tr></thead><tbody id="rep_body"></tbody></table></div>`;
+  app.innerHTML=h;fillReplicate();}
+function fillReplicate(){const p=curPortfolio,amtEl=$('#rep_amt'),amt=amtEl?(+amtEl.value||0):0,body=$('#rep_body');
+  if(!body)return;const hh=$('#rep_h');if(hh)hh.textContent=amt?'You buy':'';
+  body.innerHTML=p.holdings.map(x=>{const dollars=(amt&&x.weight!=null)?amt*x.weight:null;const shrs=(dollars&&x.price)?dollars/x.price:null;
+    return `<tr><td class="l"><span style="color:var(--acc)">${x.ticker}</span></td>
+      <td>${x.weight!=null?(x.weight*100).toFixed(1)+'%':'<span class="muted">—</span>'}</td>
+      <td>${x.ret12m!=null?`<span class="${x.ret12m>=0?'up':'dn'}">${pct(x.ret12m)}</span>`:'<span class="muted">—</span>'}</td>
+      <td>${dollars!=null?(fmt(dollars)+(shrs!=null?` <span class="muted">(~${shrs.toFixed(shrs<10?2:0)} sh)</span>`:'')):'<span class="muted">—</span>'}</td></tr>`;}).join('');}
+
 // ---- wiring ----
 let t;$('#q').addEventListener('input',e=>{const v=e.target.value.trim();clearTimeout(t);
   const stockMode=(tab==='stocks');
@@ -1637,6 +1749,300 @@ try:
     migrate_fix_values()  # repair any value-unit errors in the stored data on boot
 except Exception:
     pass
+
+# ===========================================================================
+# Community: user accounts + shared portfolios (manual / CSV) + replicate view
+# Stored in a SEPARATE db (social.db) that the nightly job never `git add`s, so
+# user data never lands in the public repo. Free-tier disk is ephemeral (resets
+# on redeploy) — set SOCIAL_DB_PATH to a persistent volume / swap for a hosted
+# Postgres URL when you want durable storage. v1 is "view & replicate manually"
+# only: we never execute trades.
+# ===========================================================================
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+SOCIAL_DB = os.environ.get("SOCIAL_DB_PATH") or os.path.join(HERE, "social.db")
+
+def connect_social():
+    con = sqlite3.connect(SOCIAL_DB, timeout=30)
+    con.row_factory = sqlite3.Row
+    try: con.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError: pass
+    return con
+
+def init_social_schema():
+    con = connect_social()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+        display_name TEXT, pw_hash TEXT NOT NULL, bio TEXT, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS portfolios (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        name TEXT, is_public INTEGER DEFAULT 0, cash REAL DEFAULT 0,
+        strategy TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS positions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, portfolio_id INTEGER NOT NULL,
+        ticker TEXT NOT NULL, shares REAL, cost_basis REAL);
+    CREATE INDEX IF NOT EXISTS idx_pf_user ON portfolios(user_id);
+    CREATE INDEX IF NOT EXISTS idx_pos_pf  ON positions(portfolio_id);
+    """)
+    con.commit(); con.close()
+
+init_social_schema()
+
+def _social_user():
+    uid = session.get("uid")
+    if not uid:
+        return None
+    con = connect_social()
+    r = con.execute("SELECT id,username,display_name,bio FROM users WHERE id=?", (uid,)).fetchone()
+    con.close()
+    return dict(r) if r else None
+
+def _clean_user(s):
+    return re.sub(r"[^a-z0-9_]", "", (s or "").strip().lower())[:24]
+
+def _clean_ticker(s):
+    return re.sub(r"[^A-Za-z0-9.\-]", "", (s or "").upper())[:12]
+
+_QUOTE = {}   # ticker -> (price, ret12m, ts); one Yahoo call serves both, cached 30 min
+def _quote(t):
+    t = _clean_ticker(t)
+    if not t:
+        return (None, None)
+    hit = _QUOTE.get(t)
+    if hit and (time.time() - hit[2] < 1800):
+        return (hit[0], hit[1])
+    price = ret = None
+    try:
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/%s?range=1y&interval=1d" % t
+        res = _http_get(url).json()["chart"]["result"][0]
+        closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+        if closes:
+            price = float(closes[-1])
+            if len(closes) >= 2 and closes[0]:
+                ret = (closes[-1] - closes[0]) / closes[0]
+    except Exception:
+        pass
+    _QUOTE[t] = (price, ret, time.time())
+    return (price, ret)
+
+def _my_portfolio(uid, create=True):
+    con = connect_social()
+    r = con.execute("SELECT * FROM portfolios WHERE user_id=? ORDER BY id LIMIT 1", (uid,)).fetchone()
+    if not r and create:
+        con.execute("INSERT INTO portfolios (user_id,name,is_public,cash,updated_at) VALUES (?,?,?,?,?)",
+                    (uid, "My Portfolio", 0, 0.0, _now()))
+        con.commit()
+        r = con.execute("SELECT * FROM portfolios WHERE user_id=? ORDER BY id LIMIT 1", (uid,)).fetchone()
+    con.close()
+    return dict(r) if r else None
+
+def _portfolio_view(pf, owner):
+    con = connect_social()
+    rows = [dict(r) for r in con.execute(
+        "SELECT id,ticker,shares,cost_basis FROM positions WHERE portfolio_id=? ORDER BY id", (pf["id"],)).fetchall()]
+    con.close()
+    holdings = []
+    for r in rows:
+        t = _clean_ticker(r["ticker"])
+        px, r12 = _quote(t)
+        val = (px * r["shares"]) if (px is not None and r["shares"]) else None
+        holdings.append({"id": r["id"], "ticker": t, "shares": r["shares"],
+                         "costBasis": r["cost_basis"], "price": px, "value": val, "ret12m": r12})
+    invested = sum(h["value"] for h in holdings if h["value"]) or 0.0
+    total = invested + (pf["cash"] or 0.0)
+    for h in holdings:
+        h["weight"] = (h["value"] / total) if (total and h["value"]) else None
+    holdings.sort(key=lambda h: (h["value"] is None, -(h["value"] or 0)))
+    wsum = rsum = 0.0
+    for h in holdings:
+        if h["value"] and h["ret12m"] is not None:
+            wsum += h["value"]; rsum += h["value"] * h["ret12m"]
+    return {"id": pf["id"], "name": pf["name"] or "Portfolio", "owner": owner,
+            "isPublic": bool(pf["is_public"]), "strategy": pf["strategy"],
+            "cash": pf["cash"] or 0.0, "totalValue": total, "investedValue": invested,
+            "positions": len(holdings), "ret12mBlended": (rsum / wsum) if wsum else None,
+            "updatedAt": pf["updated_at"], "holdings": holdings}
+
+@app.route("/api/community/register", methods=["POST"])
+def _c_register():
+    d = request.get_json(silent=True) or {}
+    uname = _clean_user(d.get("username")); pw = d.get("password") or ""
+    if len(uname) < 3:
+        return jsonify({"error": "Username must be 3+ characters (letters, numbers, _)."}), 400
+    if len(pw) < 6:
+        return jsonify({"error": "Password must be at least 6 characters."}), 400
+    con = connect_social()
+    if con.execute("SELECT 1 FROM users WHERE username=?", (uname,)).fetchone():
+        con.close(); return jsonify({"error": "That username is taken."}), 400
+    con.execute("INSERT INTO users (username,display_name,pw_hash,created_at) VALUES (?,?,?,?)",
+                (uname, (d.get("display_name") or uname)[:40], generate_password_hash(pw), _now()))
+    con.commit()
+    uid = con.execute("SELECT id FROM users WHERE username=?", (uname,)).fetchone()["id"]
+    con.close()
+    session["uid"] = uid
+    _my_portfolio(uid)
+    return jsonify({"ok": True, "user": _social_user()})
+
+@app.route("/api/community/login", methods=["POST"])
+def _c_login():
+    d = request.get_json(silent=True) or {}
+    uname = _clean_user(d.get("username"))
+    con = connect_social()
+    r = con.execute("SELECT id,pw_hash FROM users WHERE username=?", (uname,)).fetchone()
+    con.close()
+    if not r or not check_password_hash(r["pw_hash"], d.get("password") or ""):
+        return jsonify({"error": "Wrong username or password."}), 401
+    session["uid"] = r["id"]
+    return jsonify({"ok": True, "user": _social_user()})
+
+@app.route("/api/community/logout", methods=["POST"])
+def _c_logout():
+    session.pop("uid", None)
+    return jsonify({"ok": True})
+
+@app.route("/api/community/me")
+def _c_me():
+    u = _social_user()
+    if not u:
+        return jsonify({"user": None})
+    pf = _my_portfolio(u["id"])
+    return jsonify({"user": u, "portfolio": _portfolio_view(pf, u["display_name"] or u["username"])})
+
+@app.route("/api/community/portfolio", methods=["POST"])
+def _c_update_portfolio():
+    u = _social_user()
+    if not u:
+        return jsonify({"error": "Sign in first."}), 401
+    d = request.get_json(silent=True) or {}
+    pf = _my_portfolio(u["id"])
+    try:
+        cash = float(d.get("cash") or 0)
+    except (TypeError, ValueError):
+        cash = pf["cash"] or 0.0
+    con = connect_social()
+    con.execute("UPDATE portfolios SET name=?, is_public=?, cash=?, strategy=?, updated_at=? WHERE id=?",
+                ((d.get("name") or pf["name"] or "My Portfolio")[:60], 1 if d.get("isPublic") else 0,
+                 cash, (d.get("strategy") or "")[:280], _now(), pf["id"]))
+    con.commit(); con.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/community/position", methods=["POST"])
+def _c_add_position():
+    u = _social_user()
+    if not u:
+        return jsonify({"error": "Sign in first."}), 401
+    d = request.get_json(silent=True) or {}
+    t = _clean_ticker(d.get("ticker"))
+    if not t:
+        return jsonify({"error": "Enter a ticker."}), 400
+    try:
+        sh = float(d.get("shares"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Shares must be a number."}), 400
+    cb = d.get("costBasis")
+    try:
+        cb = float(cb) if cb not in (None, "") else None
+    except (TypeError, ValueError):
+        cb = None
+    pf = _my_portfolio(u["id"])
+    con = connect_social()
+    ex = con.execute("SELECT id FROM positions WHERE portfolio_id=? AND ticker=?", (pf["id"], t)).fetchone()
+    if ex:
+        con.execute("UPDATE positions SET shares=?, cost_basis=? WHERE id=?", (sh, cb, ex["id"]))
+    else:
+        con.execute("INSERT INTO positions (portfolio_id,ticker,shares,cost_basis) VALUES (?,?,?,?)", (pf["id"], t, sh, cb))
+    con.execute("UPDATE portfolios SET updated_at=? WHERE id=?", (_now(), pf["id"]))
+    con.commit(); con.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/community/position/<int:pid>", methods=["DELETE"])
+def _c_del_position(pid):
+    u = _social_user()
+    if not u:
+        return jsonify({"error": "Sign in first."}), 401
+    pf = _my_portfolio(u["id"])
+    con = connect_social()
+    con.execute("DELETE FROM positions WHERE id=? AND portfolio_id=?", (pid, pf["id"]))
+    con.commit(); con.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/community/import_csv", methods=["POST"])
+def _c_import_csv():
+    u = _social_user()
+    if not u:
+        return jsonify({"error": "Sign in first."}), 401
+    text = (request.get_json(silent=True) or {}).get("csv") or ""
+    pf = _my_portfolio(u["id"])
+    def pick(row, *names):
+        for k in row:
+            if k and k.strip().lower() in names:
+                return row[k]
+        return None
+    added = 0
+    try:
+        con = connect_social()
+        for row in csv.DictReader(io.StringIO(text)):
+            t = _clean_ticker(pick(row, "symbol", "ticker", "stock"))
+            q = pick(row, "shares", "quantity", "qty", "units")
+            if not t or q in (None, ""):
+                continue
+            try:
+                sh = float(str(q).replace(",", "").replace("$", ""))
+            except ValueError:
+                continue
+            if sh == 0:
+                continue
+            cbv = pick(row, "cost basis", "cost", "price", "avg cost", "average cost", "purchase price")
+            try:
+                cb = float(str(cbv).replace(",", "").replace("$", "")) if cbv not in (None, "") else None
+            except ValueError:
+                cb = None
+            ex = con.execute("SELECT id FROM positions WHERE portfolio_id=? AND ticker=?", (pf["id"], t)).fetchone()
+            if ex:
+                con.execute("UPDATE positions SET shares=?, cost_basis=? WHERE id=?", (sh, cb, ex["id"]))
+            else:
+                con.execute("INSERT INTO positions (portfolio_id,ticker,shares,cost_basis) VALUES (?,?,?,?)", (pf["id"], t, sh, cb))
+            added += 1
+        con.execute("UPDATE portfolios SET updated_at=? WHERE id=?", (_now(), pf["id"]))
+        con.commit(); con.close()
+    except Exception as e:
+        return jsonify({"error": "Couldn't parse that CSV: %s" % e}), 400
+    return jsonify({"ok": True, "added": added})
+
+@app.route("/api/community/feed")
+def _c_feed():
+    con = connect_social()
+    rows = con.execute("""SELECT p.*, u.username, u.display_name FROM portfolios p
+        JOIN users u ON u.id=p.user_id WHERE p.is_public=1
+        ORDER BY p.updated_at DESC LIMIT 60""").fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        r = dict(r)
+        v = _portfolio_view(r, r["display_name"] or r["username"])
+        if not v["holdings"]:
+            continue
+        top = v["holdings"][0]
+        out.append({"id": v["id"], "name": v["name"], "owner": v["owner"], "username": r["username"],
+                    "positions": v["positions"], "totalValue": v["totalValue"],
+                    "ret12mBlended": v["ret12mBlended"], "strategy": v["strategy"],
+                    "updatedAt": v["updatedAt"],
+                    "top": {"ticker": top["ticker"], "weight": top["weight"]}})
+    return jsonify({"portfolios": out})
+
+@app.route("/api/community/portfolio/<int:pid>")
+def _c_public_portfolio(pid):
+    con = connect_social()
+    r = con.execute("""SELECT p.*, u.username, u.display_name FROM portfolios p
+        JOIN users u ON u.id=p.user_id WHERE p.id=?""", (pid,)).fetchone()
+    con.close()
+    if not r:
+        return jsonify({"error": "Portfolio not found."}), 404
+    r = dict(r)
+    me = _social_user()
+    if not r["is_public"] and (not me or me["id"] != r["user_id"]):
+        return jsonify({"error": "This portfolio is private."}), 403
+    return jsonify(_portfolio_view(r, r["display_name"] or r["username"]))
 
 @app.after_request
 def _cors(resp):
